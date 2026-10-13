@@ -798,7 +798,7 @@ static void msm8992_instance_init(Object *obj)
 {
     Msm8992MachineState *s = MSM8992_MACHINE(obj);
 
-    s->secure = false;
+    s->secure = true;    /* EL3 resident like the real chain */
     s->virt   = false;
     msm8992_smem_enabled = true;   /* SBL1's SMEM tables emulated by default */
 }
