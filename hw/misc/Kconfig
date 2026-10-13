@@ -183,6 +183,9 @@ config AUX
     bool
     select I2C
 
+config MSM8992_QTIMER
+    bool
+
 config MSM8992_GCC
     bool
 

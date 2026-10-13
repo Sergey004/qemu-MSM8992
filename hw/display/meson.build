@@ -146,3 +146,5 @@ endif
 system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 
 modules += { 'hw-display': hw_display_modules }
+
+system_ss.add(when: 'CONFIG_MSM8992_FB', if_true: files('msm8992-fb.c'))

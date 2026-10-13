@@ -158,6 +158,9 @@ static void msm8992_create_cpus(Msm8992MachineState *s, MachineState *ms)
                                 (cluster << 8) | pos, &error_abort);
         object_property_set_int(OBJECT(&s->cpu[i]), "reset-cbar",
                                 MSM8992_GIC_CPU, &error_abort);
+        /* QC QTimer runs at 19.2 MHz on MSM8992 */
+        object_property_set_uint(OBJECT(&s->cpu[i]), "cntfrq",
+                                 19200000, &error_abort);
         object_property_set_bool(OBJECT(&s->cpu[i]), "has_el3",
                                  s->secure, &error_abort);
         object_property_set_bool(OBJECT(&s->cpu[i]), "has_el2",
@@ -305,8 +308,19 @@ static void msm8992_create_stubs(MachineState *ms)
     }
     create_unimplemented_device("tlmm",      MSM8992_TLMM_BASE,  0x4000);
     create_unimplemented_device("spmi-pmic", MSM8992_SPMI_BASE, 0x10000);
+    create_unimplemented_device("sec-trust-ctrl", 0xFC4B8000, 0x7000);
     create_unimplemented_device("rpm-msgram", MSM8992_RPM_MSGRAM, 0x4000);
-    create_unimplemented_device("qtimer-frame0", MSM8992_QTIMER_F0, 0x1000);
+    {
+        DeviceState *qt;
+        qt = qdev_new("msm8992-qtimer");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(qt), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(qt), 0, MSM8992_QTIMER_F0 - 0x1000);
+    }
+    {
+        DeviceState *fb;
+        fb = qdev_new("msm8992-fb");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(fb), &error_fatal);
+    }
 
     /* Tier-2/3 placeholders */
     create_unimplemented_device("kgsl-3d0",  MSM8992_KGSL_BASE, 0x10000);

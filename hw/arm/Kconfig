@@ -45,7 +45,9 @@ config MSM8992
     select ARM_GIC
     select CPU_CLUSTER
     select MSM_UARTDM
+    select MSM8992_FB
     select MSM8992_MPM
+    select MSM8992_QTIMER
     select MSM8992_GCC
     select MSM8992_TCSR
     select SDHCI
