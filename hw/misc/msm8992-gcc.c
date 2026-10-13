@@ -36,11 +36,13 @@ static uint64_t msm8992_gcc_read(void *opaque, hwaddr offset, unsigned size)
     /*
      * QC Global Clock Controller (RCG) semantics seen in SBL1:
      *   write UPDATE (bit 0) -> hardware applies the config -> STATUS reads
-     *   bit31 = ACK/LOCKED set once done. QEMU apply is instantaneous: we
-     *   always report ACK on reads (bit31 set, keep everything else as last
-     *   written).
+     *   bit31 = ACK/LOCKED set once done. QEMU apply is instantaneous, and
+     *   report UPDATE-cleared (bit0 = 0) as soon as firmware re-reads.
      */
-    v |= 0x80000000u;
+    if (v & 1) {
+        s->regs[offset >> 2] = v & ~1u;
+    }
+    v = (v & ~1u) | 0x80000000u;
     return v;
 }
 

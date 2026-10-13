@@ -15,6 +15,48 @@
 #include "hw/core/irq.h"
 #include "system/runstate.h"
 #include "qemu/timer.h"
+#include "system/system.h"
+#include "target/arm/cpu.h"
+#include "system/address-spaces.h"
+
+/*
+ * Stage-2 forensics: when the guest asks PS_HOLD (which stock firmware does
+ * after the assert banner), dump CPU registers + the live stack to
+ * /tmp/qemu-pshold-state.txt so the failing call's frame can be recovered.
+ */
+static void msm8992_mpm_forensic_dump(void)
+{
+    ARMCPU *armcpu = ARM_CPU(first_cpu);
+    CPUState *cs = CPU(armcpu);
+    CPUARMState *env = &armcpu->env;
+    FILE *f = fopen("/tmp/qemu-pshold-state.txt", "w");
+
+    if (!f)
+        return;
+    if (!env->aarch64) {
+        int i;
+        for (i = 0; i < 16; i++)
+            fprintf(f, "r%-2d = 0x%08x\n", i, env->regs[i]);
+        fprintf(f, "cpsr = 0x%08x\n", env->uncached_cpsr);
+        /* stack: current SVC sp + 2 KiB */
+        {
+            uint32_t sp = env->regs[13];
+            static uint8_t buf[2048];
+            if (address_space_read(&address_space_memory, (hwaddr)sp,
+                                   MEMTXATTRS_UNSPECIFIED, buf,
+                                   sizeof(buf)) == MEMTX_OK)
+                if (fwrite(buf, 1, sizeof(buf), f) != sizeof(buf))
+                    fprintf(f, "stack write short\n");
+        }
+    } else {
+        int i;
+        for (i = 0; i < 32; i++)
+            fprintf(f, "x%-2d = 0x%016lx\n", i, env->xregs[i]);
+    }
+    (void)cs;
+    fclose(f);
+    qemu_log("msm8992-mpm: PS_HOLD forensic state dumped to /tmp/qemu-pshold-state.txt\n");
+}
 
 #define TYPE_MSM8992_MPM "msm8992-mpm"
 OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MpmState, MSM8992_MPM)
@@ -52,10 +94,9 @@ static void msm8992_mpm_write(void *opaque, hwaddr offset, uint64_t value,
 {
     switch (offset) {
     case MPM_PS_HOLD:
-        /* Writing any configured power-key value powers the chip off */
-        if ((value & 0xFFFF) == 0 || (value & 0xFF)) {
-            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
-        }
+        qemu_log("msm8992-mpm: PS_HOLD request val=0x%" PRIx64
+                 " (shutdown suppressed for forensics)\n", value);
+        msm8992_mpm_forensic_dump();
         break;
     default:
         break;

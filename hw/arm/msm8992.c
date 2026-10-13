@@ -257,9 +257,28 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, MSM8992_SDC1_BASE);
     sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
+    /* QC's SDHCI vendor registers extend past the generic 0x100 window */
+    create_unimplemented_device("sdc1-pad", MSM8992_SDC1_BASE, 0x1000);
 
     /* Qualcomm core-config window in front of the SDHCI regs */
     create_unimplemented_device("sdhc1-vendor-cfg", MSM8992_SDC1_CONF, 0x800);
+
+    /* SDC1 endpoint is the on-board eMMC */
+    {
+        DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
+
+        if (dinfo) {
+            DeviceState *card = qdev_new(TYPE_EMMC);
+
+            qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+            if (!qdev_realize(DEVICE(card),
+                              BUS(qdev_get_child_bus(s->sdc1, "sd-bus")),
+                              &error_fatal))
+                g_assert_not_reached();
+        }
+    }
+
     /* microSD slot (SDC2): real SDHCI — the user-visible SD card of the phone */
     {
         DriveInfo *dinfo;
@@ -270,6 +289,7 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi)
         sysbus_realize_and_unref(sbd2, &error_fatal);
         sysbus_mmio_map(sbd2, 0, MSM8992_SDC2_BASE);
         sysbus_connect_irq(sbd2, 0, gic_spi[MSM8992_SDC2_IRQ]);
+        create_unimplemented_device("sdc2-pad", MSM8992_SDC2_BASE, 0x1000);
 
         dinfo = drive_get(IF_SD, 0, 1);
         if (dinfo) {
@@ -761,23 +781,6 @@ static void msm8992_init(MachineState *machine)
 
     msm8992_create_uart(s, gic_spi);
     msm8992_create_sdc1(s, gic_spi);
-
-    /* attach -drive if=sd image (the FFU-flashed eMMC) to SDC1 */
-    {
-        DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
-        if (dinfo) {
-            DeviceState *card;
-            card = qdev_new(TYPE_SD_CARD);
-            qdev_prop_set_drive_err(card, "drive",
-                                    blk_by_legacy_dinfo(dinfo),
-                                    &error_fatal);
-            if (!qdev_realize(DEVICE(card),
-                              BUS(qdev_get_child_bus(s->sdc1, "sd-bus")),
-                              &error_fatal)) {
-                g_assert_not_reached();
-            }
-        }
-    }
 
     msm8992_create_stubs(machine);
 
