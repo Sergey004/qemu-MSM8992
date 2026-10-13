@@ -195,6 +195,9 @@ config MSM8992_TCSR
 config MSM8992_MPM
     bool
 
+config MSM8992_APCS
+    bool
+
 config UNIMP
     bool
 

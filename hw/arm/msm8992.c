@@ -115,10 +115,11 @@ struct Msm8992MachineState {
     bool virt;                      /* provide EL2 */
 };
 
-/* GIC PPI inputs are banked: input line = cpu * GIC_INTERNAL + 32 + ppi... */
+/* GIC PPI inputs sit after the SPI pins: index = num_spi + cpu*32 + INTID,
+ * where INTID = 16 + ppi (arm_gic.c gic_set_irq input layout). */
 static inline int msm8992_gic_ppi_line(int cpu_nr, int ppi)
 {
-    return cpu_nr * GIC_INTERNAL + GIC_NR_SGIS + ppi;
+    return MSM8992_GIC_NUM_SPI + cpu_nr * GIC_INTERNAL + GIC_NR_SGIS + ppi;
 }
 
 static void msm8992_create_cpus(Msm8992MachineState *s, MachineState *ms)
@@ -294,6 +295,12 @@ static void msm8992_create_stubs(MachineState *ms)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(mpm), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(mpm), 0, MSM8992_MPM_BASE);
 
+    /* APCS doorbell pad — stock SmdLib kicks 0xF900D008 on the 8994-family
+     * fallback path when its HWIO protocol can't resolve "APCS_KPSS_GLB". */
+    DeviceState *apcs = qdev_new("msm8992-apcs");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(apcs), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(apcs), 0, 0xF900D000);
+
     /*
      * Tier-1 register blocks the firmware touches on every boot.
      * LOG_UNIMP traces from these feeds the §9 gap registry (RESEARCH.md):
@@ -306,6 +313,15 @@ static void msm8992_create_stubs(MachineState *ms)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(g), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(g), 0, MSM8992_GCC_BASE);
     }
+    /*
+     * Carpet-stub the whole QGIC/APCS chipset window (DeviceMemoryMap.h
+     * "TERMINATOR" 0xF9000000+0x113000): the real GIC dist/cpu, QTimer and
+     * the APCS doorbell pad are mapped at priority 0 and win over this
+     * -1000-priority filler; everything else (clock blocks etc.) logs-and-
+     * reads-as-zero instead of faulting.
+     */
+    create_unimplemented_device("qgic-adjacent", 0xF9000000ULL, 0x113000);
+
     create_unimplemented_device("tlmm",      MSM8992_TLMM_BASE,  0x4000);
     create_unimplemented_device("spmi-pmic", MSM8992_SPMI_BASE, 0x10000);
     create_unimplemented_device("sec-trust-ctrl", 0xFC4B8000, 0x7000);
@@ -323,6 +339,8 @@ static void msm8992_create_stubs(MachineState *ms)
     }
 
     /* Tier-2/3 placeholders */
+    create_unimplemented_device("mmss-lo",   0xFD800000ULL, 0xC0000);
+    create_unimplemented_device("vbif",      0xFD8C0000ULL, 0x40000);
     create_unimplemented_device("kgsl-3d0",  MSM8992_KGSL_BASE, 0x10000);
     create_unimplemented_device("mdp5",      MSM8992_MDP5_BASE, 0xB4000);
     create_unimplemented_device("smmu-mmu0", MSM8992_SMMU_MMU0, 0xB000);
@@ -362,9 +380,15 @@ static void msm8992_create_stubs(MachineState *ms)
 #define SMEM_ITEM_PTABLE      9
 #define SMEM_ITEM_BOARD_INFO  137
 #define SMEM_ITEM_RAM_PTABLE  402   /* SMEM_USABLE_RAM_PARTITION_TABLE */
+#define SMEM_ITEM_CHAN_ALLOC  13    /* SMEM_CHANNEL_ALLOC_TBL */
+#define SMEM_ITEM_SMD_BASE    14    /* SMEM_SMD_BASE_ID: ctrl per cid */
+#define SMEM_ITEM_SMD_FIFO    338   /* SMEM_SMD_FIFO_BASE_ID: fifo per cid */
 #define SMEM_PTABLE_OFF       0x4000
 #define SMEM_BOARD_INFO_OFF   0x5000
 #define SMEM_RAMPT_OFF        0x6000
+#define SMEM_CHAN_TBL_OFF     0x30000
+#define SMEM_SMD_CTRL_OFF     0x31000   /* cid 0: rpm_requests ctrl (88 B) */
+#define SMEM_SMD_FIFO_OFF     0x32000   /* cid 0: fifo (2 KiB) */
 
 static const struct { char name[16]; uint32_t start, size, attr; } msm8992_flash_ptn[] = {
   {"DPP", 0x00001000, 0x00004000},
@@ -534,6 +558,48 @@ static void msm8992_populate_smem(MachineState *ms)
             msm8992_smem_store(base, p + 16 + k * 28 + 24, 0);
         }
     }
+
+    /* SMD ghost: a pre-opened APPS<->RPM channel named "rpm_requests".
+     * Without an RPM firmware image, ClockDxe/RpmLib would otherwise spin
+     * forever in smd_is_port_open("rpm_requests", SMD_APPS_RPM).  We plant
+     * cid 0 with both half-channels OPENED but CD=0: RpmLib then runs in
+     * "rpm_is_up == no" autocomplete mode and never blocks on wire ACKs.
+     *
+     * #13 SMEM_CHANNEL_ALLOC_TBL: 64 x {name[20], cid, prop, ref_count}
+     *     entry 0 = { "rpm_requests", 0, ctype=SMD_APPS_RPM(0x0F), 1 }
+     * #14 SMEM_SMD_BASE_ID+0: smd_port_ctrl_info {ch0,ch1}, each half
+     *     11 x u32 { state=2(OPENED), DTR_DSR=1, CTS_RTS=1, CD=0, ... }
+     * #338 SMEM_SMD_FIFO_BASE_ID+0: 2 KiB fifo (tx|rx halves) */
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_CHAN_ALLOC * 16 + 0, 1);
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_CHAN_ALLOC * 16 + 4,
+                       SMEM_CHAN_TBL_OFF);
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_CHAN_ALLOC * 16 + 8,
+                       64 * 32);
+    {
+        hwaddr t = SMEM_CHAN_TBL_OFF;
+        memcpy(base + t + 0, "rpm_requests", 12);
+        msm8992_smem_store(base, t + 20, 0);        /* cid 0 */
+        msm8992_smem_store(base, t + 24, 0x0000000F); /* prop: ctype APPS_RPM */
+        msm8992_smem_store(base, t + 28, 1);        /* ref_count */
+
+        hwaddr c = SMEM_SMD_CTRL_OFF;
+        int half;
+        for (half = 0; half < 2; half++) {
+            msm8992_smem_store(base, c + half * 44 + 0, 2); /* SMD_SS_OPENED */
+            msm8992_smem_store(base, c + half * 44 + 4, 1); /* DTR_DSR */
+            msm8992_smem_store(base, c + half * 44 + 8, 1); /* CTS_RTS */
+            /* CD/RI/indices stay 0 */
+        }
+    }
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_SMD_BASE * 16 + 0, 1);
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_SMD_BASE * 16 + 4,
+                       SMEM_SMD_CTRL_OFF);
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_SMD_BASE * 16 + 8, 88);
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_SMD_FIFO * 16 + 0, 1);
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_SMD_FIFO * 16 + 4,
+                       SMEM_SMD_FIFO_OFF);
+    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_SMD_FIFO * 16 + 8,
+                       0x2000);
 
     /* smem_addr_info beacon for SmemDxe (struct smem_addr_info @ 0xFE805FF0),
      * and the whole IMEM window — stock firmware reads cookies/target info

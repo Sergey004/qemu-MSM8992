@@ -50,6 +50,7 @@ config MSM8992
     select MSM8992_QTIMER
     select MSM8992_GCC
     select MSM8992_TCSR
+    select MSM8992_APCS
     select SDHCI
     select UNIMP
 
