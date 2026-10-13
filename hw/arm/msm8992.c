@@ -664,6 +664,20 @@ static void msm8992_init(MachineState *machine)
                                &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0xFEC00000, r);
     }
+    {
+        MemoryRegion *r = g_new(MemoryRegion, 1);
+        memory_region_init_ram(r, NULL, "msm8992.hole-ef", 0x0F000000,
+                               &error_fatal);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            0xE0000000, r, 0);
+    }
+    {
+        MemoryRegion *r = g_new(MemoryRegion, 1);
+        memory_region_init_ram(r, NULL, "msm8992.hole-ce", 0x20000000,
+                               &error_fatal);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            0xC0000000, r, 0);
+    }
 
     msm8992_create_uart(s, gic_spi);
     msm8992_create_sdc1(s, gic_spi);
