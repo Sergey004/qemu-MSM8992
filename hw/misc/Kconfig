@@ -183,6 +183,15 @@ config AUX
     bool
     select I2C
 
+config MSM8992_GCC
+    bool
+
+config MSM8992_TCSR
+    bool
+
+config MSM8992_MPM
+    bool
+
 config UNIMP
     bool
 

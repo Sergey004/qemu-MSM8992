@@ -65,6 +65,9 @@ struct arm_boot_info {
      * control whether Linux is booted as secure(true) or non-secure(false).
      */
     bool secure_boot;
+    /* msm8992: entry image is a 32-bit ARM ELF (stock W10M/UEFI chain);
+     * start the A53 in AArch32 SVC instead of AArch64. */
+    bool aa32_entry;
     int (*atag_board)(const struct arm_boot_info *info, void *p);
     /* multicore boards that use the default secondary core boot functions
      * can ignore these two function calls. If the default functions won't
@@ -238,4 +241,21 @@ void arm_write_bootloader(const char *name,
                           const ARMInsnFixup *insns,
                           const uint32_t *fixupcontext);
 
+
+/* ---------------- vendor SMC/HVC service hook ---------------- */
+
+/*
+ * Boards whose firmware makes non-PSCI secure-monitor calls (e.g. Qualcomm
+ * SCM) can register a vendor handler. When a handler is registered, TCG
+ * delivers every SMC/HVC to arm_handle_psci_call(); PSCI function IDs are
+ * still served by the built-in PSCI support, everything else is routed to
+ * the handler. The handler returns the AArch64 x0 result.
+ */
+typedef int32_t (*ARMSmcVendorHandler)(ARMCPU *cpu, uint64_t func_id,
+                                       uint64_t arg1, uint64_t arg2,
+                                       uint64_t arg3);
+
+void arm_register_smc_vendor_handler(ARMSmcVendorHandler handler);
+
 #endif /* HW_ARM_BOOT_H */
+ /* HW_ARM_BOOT_H */

@@ -24,8 +24,23 @@
 #include "system/runstate.h"
 #include "internals.h"
 #include "arm-powerctl.h"
+#include "hw/arm/boot.h"
 #include "target/arm/multiprocessing.h"
 #include "target/arm/trace.h"
+
+static ARMSmcVendorHandler arm_smc_vendor_handler;
+
+void arm_register_smc_vendor_handler(ARMSmcVendorHandler handler)
+{
+    arm_smc_vendor_handler = handler;
+}
+
+/* PSCI function IDs always live in the 0x8400xxxx / 0xC400xxxx windows */
+static bool arm_is_psci_fid(uint64_t fid)
+{
+    uint32_t hi = fid >> 16;
+    return hi == 0x8400 || hi == 0xC400;
+}
 
 bool arm_is_psci_call(ARMCPU *cpu, int excp_type)
 {
@@ -39,12 +54,14 @@ bool arm_is_psci_call(ARMCPU *cpu, int excp_type)
 
     switch (excp_type) {
     case EXCP_HVC:
-        if (cpu->psci_conduit != QEMU_PSCI_CONDUIT_HVC) {
+        if (cpu->psci_conduit != QEMU_PSCI_CONDUIT_HVC &&
+            !arm_smc_vendor_handler) {
             return false;
         }
         break;
     case EXCP_SMC:
-        if (cpu->psci_conduit != QEMU_PSCI_CONDUIT_SMC) {
+        if (cpu->psci_conduit != QEMU_PSCI_CONDUIT_SMC &&
+            !arm_smc_vendor_handler) {
             return false;
         }
         break;
@@ -82,6 +99,13 @@ void arm_handle_psci_call(ARMCPU *cpu)
     }
     trace_arm_psci_call(param[0], param[1], param[2], param[3],
                         arm_cpu_mp_affinity(cpu));
+
+    /* Non-PSCI SMC/HVC (e.g. Qualcomm SCM): hand to the board hook */
+    if (arm_smc_vendor_handler && !arm_is_psci_fid(param[0])) {
+        ret = arm_smc_vendor_handler(cpu, param[0], param[1], param[2],
+                                     param[3]);
+        goto err;
+    }
 
     if ((param[0] & QEMU_PSCI_0_2_64BIT) && !is_a64(env)) {
         ret = QEMU_PSCI_RET_NOT_SUPPORTED;
@@ -164,6 +188,24 @@ void arm_handle_psci_call(ARMCPU *cpu)
         /* Affinity levels are not supported in QEMU */
         if (param[1] & 0xfffe0000) {
             ret = QEMU_PSCI_RET_INVALID_PARAMS;
+            break;
+        }
+        /*
+         * Lumia/WOA quirk (only when a board vendor handler is registered):
+         * the firmware's MpPark protocol uses CPU_SUSPEND(power_state=0,
+         * entry, ctx) as "power-gate me and resume AT entry". Real TZ/HYP
+         * restarts the core at `entry` with x0=ctx on wake; the stock WFI
+         * emulation below parks the core at the SMC return site and never
+         * matches that, deadlocking BootShim's "Waiting for all CPUs".
+         * Emulate the QC virtualized powergate: jump to entry immediately.
+         */
+        if (arm_smc_vendor_handler && param[2]) {
+            cpu_set_pc(CPU(cpu), param[2]);
+            if (is_a64(env)) {
+                env->xregs[0] = param[3];
+            } else {
+                env->regs[0] = param[3];
+            }
             break;
         }
         /* Powerdown is not supported, we always go into WFI */

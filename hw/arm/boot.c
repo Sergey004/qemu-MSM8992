@@ -690,7 +690,16 @@ static void do_cpu_reset(void *opaque)
                 g_assert_not_reached();
             }
 
-            cpu_set_pc(cs, entry);
+            if (info->aa32_entry) {
+                /* A32 SVC entry at EL1 for the 32-bit image */
+                env->aarch64 = false;
+                env->uncached_cpsr = ARM_CPU_MODE_SVC | CPSR_I | CPSR_F
+                                     | CPSR_A;
+                cpu_set_pc(cs, entry);
+                arm_rebuild_hflags(env);
+            } else {
+                cpu_set_pc(cs, entry);
+            }
         } else {
             /*
              * If we are booting Linux then we might need to do so at:
@@ -909,6 +918,26 @@ static void arm_setup_direct_kernel_boot(ARMCPU *cpu,
     if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
         primary_loader = bootloader_aarch64;
         elf_machine = EM_AARCH64;
+        /*
+         * msm8992/W10M: stock firmware partitions are 32-bit ARM ELFs.
+         * Sniff e_machine; for EM_ARM run the A53 in AArch32 SVC mode
+         * rather than rejecting the image.
+         */
+        if (info->kernel_filename) {
+            uint8_t eh[20];
+            FILE *kf = fopen(info->kernel_filename, "rb");
+
+            if (kf && fread(eh, 1, sizeof(eh), kf) == sizeof(eh) &&
+                eh[0] == 0x7f && eh[1] == 'E' && eh[2] == 'L' &&
+                eh[3] == 'F' && eh[4] == 1 /* ELFCLASS32 */ &&
+                eh[18] == 0x28 && eh[19] == 0x00 /* EM_ARM */) {
+                elf_machine = EM_ARM;
+                info->aa32_entry = true;
+            }
+            if (kf) {
+                fclose(kf);
+            }
+        }
     } else {
         primary_loader = bootloader;
         if (!info->write_board_setup) {

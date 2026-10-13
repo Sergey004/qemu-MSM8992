@@ -177,3 +177,8 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
 system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
 system_ss.add(when: 'CONFIG_AXIADO_CLK', if_true: files('axiado_clk.c'))
+
+system_ss.add(when: 'CONFIG_MSM8992_MPM', if_true: files('msm-mpm.c'))
+
+system_ss.add(when: 'CONFIG_MSM8992_GCC', if_true: files('msm8992-gcc.c'))
+system_ss.add(when: 'CONFIG_MSM8992_TCSR', if_true: files('msm8992-tcsr.c'))
