@@ -22,6 +22,7 @@ typedef struct Msm8992GccState {
     MemoryRegion iomem;
     uint32_t regs[GCC_REGS_WORDS];
     uint64_t hot_bm[GCC_REGS_WORDS / 64 + 1];
+    uint64_t upd_bm[GCC_REGS_WORDS / 64 + 1]; /* last write to word had bit0=1 */
 } Msm8992GccState;
 
 static uint64_t msm8992_gcc_read(void *opaque, hwaddr offset, unsigned size)
@@ -31,29 +32,45 @@ static uint64_t msm8992_gcc_read(void *opaque, hwaddr offset, unsigned size)
 
     if (offset > MSM8992_GCC_SIZE - 4)
         return 0;
-    v = s->regs[offset >> 2];
+    {
+        size_t word = offset >> 2;
 
-    /*
-     * QC Global Clock Controller (RCG) semantics seen in SBL1:
-     *   write UPDATE (bit 0) -> hardware applies the config -> STATUS reads
-     *   bit31 = ACK/LOCKED set once done. QEMU apply is instantaneous, and
-     *   report UPDATE-cleared (bit0 = 0) as soon as firmware re-reads.
-     */
-    if (v & 1) {
-        s->regs[offset >> 2] = v & ~1u;
+        v = s->regs[word];
+        /*
+         * QC RCG semantics seen in SBL1's clock bring-up:
+         *  - CMD_RCGR-class: software writes UPDATE=1(bit0), then polls
+         *    `tbnz bit31` for the busy flag to FALL — we apply instantly,
+         *    so after an UPDATE-write reads report busy=0, update=0.
+         *  - PLL_STATUS/GPLL-class: init sets config with bit0=0 and the
+         *    firmware then polls for bit31=1 (LOCK). Our static model sets
+         *    the lock on the first non-UPDATE write and reports it always.
+         * In untouched state a register reads as "locked" (0x80000000) —
+         * matches a quiescent, working clock tree.
+         */
+        if (s->upd_bm[word / 64] & (1ULL << (word & 63))) {
+            return v & ~0x80000001u;
+        }
+        if (!(s->hot_bm[word / 64] & (1ULL << (word & 63)))) {
+            return v | 0x80000000u;
+        }
+        return v;
     }
-    v = (v & ~1u) | 0x80000000u;
-    return v;
 }
 
 static void msm8992_gcc_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
     Msm8992GccState *s = MSM8992_GCC(opaque);
+    size_t word;
     if (offset > MSM8992_GCC_SIZE - 4)
         return;
-    s->regs[offset >> 2] = value;
-    s->hot_bm[(offset >> 2) / 64] |= 1ULL << ((offset >> 2) & 63);
+    word = offset >> 2;
+    s->regs[word] = value;
+    s->hot_bm[word / 64] |= 1ULL << (word & 63);
+    if (value & 1)
+        s->upd_bm[word / 64] |= 1ULL << (word & 63);
+    else
+        s->upd_bm[word / 64] &= ~(1ULL << (word & 63));
 }
 
 static const MemoryRegionOps msm8992_gcc_ops = {
@@ -77,6 +94,7 @@ static void msm8992_gcc_reset(DeviceState *dev)
     Msm8992GccState *s = MSM8992_GCC(dev);
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->hot_bm, 0, sizeof(s->hot_bm));
+    memset(s->upd_bm, 0, sizeof(s->upd_bm));
 }
 
 static void msm8992_gcc_class_init(ObjectClass *oc, const void *data)

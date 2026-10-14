@@ -113,6 +113,7 @@ struct Msm8992MachineState {
 
     bool secure;                    /* provide EL3 (stock-TZ experiments) */
     bool virt;                      /* provide EL2 */
+    bool fullchain;                 /* PBL-stub->SBL1->TZ->UEFI chain mode */
 };
 
 /* GIC PPI inputs sit after the SPI pins: index = num_spi + cpu*32 + INTID,
@@ -705,6 +706,71 @@ static bool msm8992_smem_enabled;
  * anything that matters later (PIL auth, TZ app mgmt) gets promoted to a real
  * reply as the traces demand.
  */
+/*
+ * Full-chain mode staging: a minimal PBL shared-data page at 0x80000 so the
+ * real SBL1's early reads land on something sane. Field order follows
+ * XBLLoaderLib/pbl_sbl_shared.h (boot_pbl_shared_data_type, A64: pointers are
+ * 8 bytes). Everything we can afford starts zeroed; only the fields known to
+ * gate its early behaviour get real values (auth/hash checks off).
+ *
+ * Stage iteratively: every DFAR an SBL1 run reports against this map is the
+ * next field to populate for real.
+ */
+#define MSM8992_PBL_SHARED   0x80000ULL
+static void msm8992_stage_pbl_shared(MachineState *ms)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(ms->ram);
+    uint8_t *p = ram + MSM8992_PBL_SHARED;
+
+    memset(p, 0, 0x1000);
+    stl_le_p(p + 0x00, 0x00010001); /* shared_data_version (v2) */
+    stl_le_p(p + 0x04, 0);          /* pbl_version */
+    stl_le_p(p + 0x08, 0);          /* pbl_patch_version */
+    stl_le_p(p + 0x0C, 0);          /* boot_option */
+    stl_le_p(p + 0x10, 0);          /* bl_loader_auth_enabled */
+    stl_le_p(p + 0x14, 1);          /* hash_integrity_check_disabled */
+    stl_le_p(p + 0x18, 1);          /* bl_sec_boot_flow_supported */
+    stl_le_p(p + 0x1C, 1);          /* bl_sec_auth_disabled */
+    stq_le_p(p + 0x20, MSM8992_PBL_SHARED + 0x4000); /* boot_stack_base */
+    stl_le_p(p + 0x28, 0x4000);     /* boot_stack_size */
+    /* reserved_fields_bl[32] zero; nested pointers point at spare pages */
+    stq_le_p(p + 0xB0,  MSM8992_PBL_SHARED + 0x8000);  /* timestamps */
+    stq_le_p(p + 0xB8,  MSM8992_PBL_SHARED + 0x9000);  /* bl_shared_data */
+    stq_le_p(p + 0xC0,  MSM8992_PBL_SHARED + 0xA000);  /* pbl_clock_shared_data */
+    stq_le_p(p + 0xC8,  MSM8992_PBL_SHARED + 0xB000);  /* elf_img_shared_info */
+    stq_le_p(p + 0xD0,  MSM8992_PBL_SHARED + 0xC000);  /* secboot_shared_data */
+    stq_le_p(p + 0xD8,  MSM8992_PBL_SHARED + 0xD000);  /* pcie_bhi_shared_info */
+    stq_le_p(p + 0xE0,  MSM8992_PBL_SHARED + 0xE000);  /* flash_shared_data */
+    stq_le_p(p + 0xF0,  MSM8992_PBL_SHARED + 0xF000);  /* cache_mmu_share_data */
+
+    /* pbl_elf_img_share_info_type (0xB000 page): version + NULL meta */
+    stl_le_p(p + 0xB000, 0x00010000);
+
+    /* cache_mmu_share_info (0xF000 page): version, page_tbl_base=0, size=0 */
+    stl_le_p(p + 0xF000, 0x00010001);
+
+    /* boot_flash_shared_dev_info_type (0xE000 page):
+     * the phone boots from eMMC on SDC1; PBL records its probe result here. */
+    stl_le_p(p + 0xE000, 0x00010000); /* shared_data_version */
+    stl_le_p(p + 0xE004, 4);          /* type = SDC_FLASH */
+    stl_le_p(p + 0xE008, 0xF9824000); /* CS_base: SDCC1 core config */
+    stl_le_p(p + 0xE00C, 8);          /* data_width */
+    /* ctrl_type = 0 (SDHC/QC default) */
+    /* union dev_info.sdc @ +0x14: */
+    stl_le_p(p + 0xE014, 0);          /* mem (enum 0: unknown) */
+    stl_le_p(p + 0xE018, 4);          /* card_type (MMC-like) */
+    stl_le_p(p + 0xE01C, 2);          /* card_state: standby */
+    stl_le_p(p + 0xE020, 2);          /* rca (QEMU emmc default) */
+    stl_le_p(p + 0xE024, 200000000);  /* mclk */
+    stl_le_p(p + 0xE028, 0);          /* port: SDC1 */
+    stl_le_p(p + 0xE02C, 0);          /* boot_cfg */
+    stl_le_p(p + 0xE030, 2);          /* data_width: 8-bit */
+    stl_le_p(p + 0xE034, 1);          /* is_gpt_parti */
+    stl_le_p(p + 0xE038, 1);          /* is_primary_table */
+    stl_le_p(p + 0xE03C, 0x0001A000); /* starting_lba: SBL1 */
+    stl_le_p(p + 0xE044, 0x0001A7FF); /* ending_lba */
+}
+
 static int32_t msm8992_scm_call(ARMCPU *cpu, uint64_t id, uint64_t a1,
                                 uint64_t a2, uint64_t a3)
 {
@@ -762,7 +828,7 @@ static void msm8992_init(MachineState *machine)
     }
     {
         MemoryRegion *r = g_new(MemoryRegion, 1);
-        memory_region_init_ram(r, NULL, "msm8992.sbl-work", 0x80000,
+        memory_region_init_ram(r, NULL, "msm8992.sbl-work", 0x400000,
                                &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0xFEC00000, r);
     }
@@ -793,7 +859,16 @@ static void msm8992_init(MachineState *machine)
 
     msm8992_create_stubs(machine);
 
-    arm_register_smc_vendor_handler(msm8992_scm_call);
+    /*
+     * fullchain=on: boot the real chain (pblstub -> SBL1 -> TZ -> UEFI).
+     * The synthetic SCM vendor hook must NOT be registered then: SMCs have
+     * to reach the guest's own EL3 monitor once TZ installs it. Also use
+     * the PSCI "disabled" conduit so QEMU's internal PSCI shim doesn't eat
+     * vendor SMCs either (mirrors virt's firmware_loaded behaviour).
+     */
+    if (!s->fullchain) {
+        arm_register_smc_vendor_handler(msm8992_scm_call);
+    }
 
     if (machine->kernel_filename) {
         s->bootinfo.ram_size       = machine->ram_size;
@@ -803,9 +878,13 @@ static void msm8992_init(MachineState *machine)
         s->bootinfo.initrd_filename  = machine->initrd_filename;
         s->bootinfo.skip_dtb_autoload = true; /* Windows uses ACPI, not DTB */
         /* Always SMC: the vendor hook below also catches HVC-carried PSCI. */
-        s->bootinfo.psci_conduit   = QEMU_PSCI_CONDUIT_SMC;
+        s->bootinfo.psci_conduit   = s->fullchain ? QEMU_PSCI_CONDUIT_DISABLED
+                                                  : QEMU_PSCI_CONDUIT_SMC;
         s->bootinfo.gic_cpu_if_addr = MSM8992_GIC_CPU;
         s->bootinfo.board_id        = -1;
+        if (s->fullchain) {
+            msm8992_stage_pbl_shared(machine);
+        }
         arm_load_kernel(ARM_CPU(&s->cpu[MSM8992_BOOT_CPU]), machine,
                         &s->bootinfo);
         /*
@@ -840,6 +919,16 @@ static void msm8992_set_virt(Object *obj, bool value, Error **errp)
 static bool msm8992_get_smem(Object *obj, Error **errp)
 {
     return msm8992_smem_enabled;
+}
+
+static bool msm8992_get_fullchain(Object *obj, Error **errp)
+{
+    return MSM8992_MACHINE(obj)->fullchain;
+}
+
+static void msm8992_set_fullchain(Object *obj, bool value, Error **errp)
+{
+    MSM8992_MACHINE(obj)->fullchain = value;
 }
 
 static void msm8992_set_smem(Object *obj, bool value, Error **errp)
@@ -904,6 +993,12 @@ static void msm8992_machine_class_init(ObjectClass *oc, const void *data)
                                    msm8992_set_virt);
     object_class_property_set_description(oc, "virtualization",
         "Provide EL2");
+    object_class_property_add_bool(oc, "fullchain", msm8992_get_fullchain,
+                                   msm8992_set_fullchain);
+    object_class_property_set_description(oc, "fullchain",
+        "Boot the real chain: -kernel=pblstub64 + SBL1 staged at 0xFEC04000 "
+        "(via -device loader), TZ resident at EL3; synthetic SCM vendor hook "
+        "and QEMU PSCI are disabled so guest EL3 receives SMCs");
     object_class_property_add_bool(oc, "smem", msm8992_get_smem,
                                    msm8992_set_smem);
     object_class_property_add_bool(oc, "smem-trace",
