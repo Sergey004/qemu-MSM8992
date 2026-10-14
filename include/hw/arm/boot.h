@@ -105,6 +105,12 @@ struct arm_boot_info {
      * to EL3) then PSCI will not be enabled.
      */
     int psci_conduit;
+    /* msm8992: exception level to enter ELF/kernel images at (0 = keep the
+     * CPU's reset EL; 1..3 = call arm_emulate_firmware_reset in do_cpu_reset).
+     * Machines that back the guest with an SBL1/TZ at EL3 set this to 1 for
+     * the plain-UEFI lane (i.e. what the firmware would have done anyway).
+     */
+    int target_el;
     /* Used internally by arm_boot.c */
     int is_linux;
     hwaddr initrd_start;

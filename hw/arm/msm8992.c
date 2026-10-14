@@ -892,6 +892,10 @@ static void msm8992_init(MachineState *machine)
         s->bootinfo.board_id        = -1;
         if (s->fullchain) {
             msm8992_stage_pbl_shared(machine);
+        } else {
+            /* plain -kernel UEFI lane: we'd have TZ/SBL1 do this for real;
+             * emulate the drop to NS EL1 so UEFI doesn't hit its EL3 assert */
+            s->bootinfo.target_el = 1;
         }
         arm_load_kernel(ARM_CPU(&s->cpu[MSM8992_BOOT_CPU]), machine,
                         &s->bootinfo);

@@ -699,6 +699,12 @@ static void do_cpu_reset(void *opaque)
                 arm_rebuild_hflags(env);
             } else {
                 cpu_set_pc(cs, entry);
+                /* Board request: drop to a specific EL for this image
+                 * (what a QC TZ/SBL1 would have done by hand). */
+                if (info->target_el > 0 &&
+                    arm_feature(env, ARM_FEATURE_EL3)) {
+                    arm_emulate_firmware_reset(cs, info->target_el);
+                }
             }
         } else {
             /*
