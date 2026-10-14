@@ -262,6 +262,7 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi)
 
     /* Qualcomm core-config window in front of the SDHCI regs */
     create_unimplemented_device("sdhc1-vendor-cfg", MSM8992_SDC1_CONF, 0x800);
+    create_unimplemented_device("sdhc2-vendor-cfg", 0xF98A4000ULL, 0x900);
 
     /* SDC1 endpoint is the on-board eMMC */
     {
@@ -721,8 +722,9 @@ static void msm8992_init(MachineState *machine)
     qemu_irq *gic_spi;
     unsigned int i;
 
-    if (machine->ram_size != MSM8992_DRAM_SIZE) {
-        error_report("msm8992: Talkman has exactly 3GiB DRAM (use -m 3G)");
+    if (machine->ram_size != MSM8992_DRAM_SIZE &&
+        machine->ram_size != MSM8992_DRAM_SIZE + 0x20000000ULL) {
+        error_report("msm8992: Talkman DRAM is 3GiB (usable to 0xE0000000; use -m 3G or -m 3584M)");
         exit(1);
     }
 
@@ -764,19 +766,26 @@ static void msm8992_init(MachineState *machine)
                                &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0xFEC00000, r);
     }
+    /*
+     * Backfill the DSC-declared DRAM footprint [ram_size .. 0xE0000000):
+     * DeviceMemoryMap.h/SMEM ram-ptable both advertise the phone as
+     * fragments summing to a 0xE0000000 bytes top address, so any
+     * page the allocator layers above ram_size must still resolve.
+     */
+    if (machine->ram_size < 0xE0000000ULL) {
+        MemoryRegion *r = g_new(MemoryRegion, 1);
+        memory_region_init_ram(r, NULL, "msm8992.hole-ce",
+                               0xE0000000ULL - machine->ram_size,
+                               &error_fatal);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            machine->ram_size, r, 0);
+    }
     {
         MemoryRegion *r = g_new(MemoryRegion, 1);
         memory_region_init_ram(r, NULL, "msm8992.hole-ef", 0x0F000000,
                                &error_fatal);
         memory_region_add_subregion_overlap(get_system_memory(),
                                             0xE0000000, r, 0);
-    }
-    {
-        MemoryRegion *r = g_new(MemoryRegion, 1);
-        memory_region_init_ram(r, NULL, "msm8992.hole-ce", 0x20000000,
-                               &error_fatal);
-        memory_region_add_subregion_overlap(get_system_memory(),
-                                            0xC0000000, r, 0);
     }
 
     msm8992_create_uart(s, gic_spi);
