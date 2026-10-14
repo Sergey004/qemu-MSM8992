@@ -743,8 +743,16 @@ static void msm8992_stage_pbl_shared(MachineState *ms)
     stq_le_p(p + 0xE0,  MSM8992_PBL_SHARED + 0xE000);  /* flash_shared_data */
     stq_le_p(p + 0xF0,  MSM8992_PBL_SHARED + 0xF000);  /* cache_mmu_share_data */
 
-    /* pbl_elf_img_share_info_type (0xB000 page): version + NULL meta */
-    stl_le_p(p + 0xB000, 0x00010000);
+    /* pbl_elf_img_share_info_type (0xB000 page): version + meta ptr */
+    stl_le_p(p + 0xB000, 0x00010000);                 /* shared_data_version */
+    stq_le_p(p + 0xB008, MSM8992_PBL_SHARED + 0xC800);/* elf_img_meta_info */
+    /* num_of_bytes_read_from_elf stays 0 */
+
+    /* sec_img_auth_elf_info_type （meta page itself）: ρεal hdr/phdr pointers
+     * into a copy of SBL1's ELF header we stage at 0x80000+0xC900 */
+    stq_le_p(p + 0xC800, MSM8992_PBL_SHARED + 0xC900); /* elf_hdr */
+    stq_le_p(p + 0xC808, MSM8992_PBL_SHARED + 0xCA00); /* prog_hdr */
+    stq_le_p(p + 0xC810, 0);                           /* hash_seg_hdr */
 
     /* cache_mmu_share_info (0xF000 page): version, page_tbl_base=0, size=0 */
     stl_le_p(p + 0xF000, 0x00010001);
