@@ -46,6 +46,9 @@ struct Msm8992SmdGhostState {
     QEMUTimer   *tick;
     qemu_irq     irq;
     uint32_t     last_ch0_wr;
+    uint32_t     last_ch0_state;
+    bool         irq_asserted;
+    uint32_t     last_reply_wr;
     uint64_t     reply_serial;
 };
 
@@ -70,41 +73,96 @@ static void msm8992_smd_ghost_tick(void *opaque)
 {
     Msm8992SmdGhostState *s = MSM8992_SMD_GHOST(opaque);
 
-    /* ch0 = APPS->RPM (write side), ch1 = RPM->APPS (reply side) */
     uint32_t ch0_wr = smd_rd32(SMD_GHOST_CTRL_OFF + 0x28);
     uint32_t ch0_rd = smd_rd32(SMD_GHOST_CTRL_OFF + 0x24);
+    uint32_t ch0_state = smd_rd32(SMD_GHOST_CTRL_OFF + 0x00);
+    uint32_t ch1_rd = smd_rd32(SMD_GHOST_CTRL_OFF + 0x24 + 0x2c);
+    uint32_t ch1_wr = smd_rd32(SMD_GHOST_CTRL_OFF + 0x28 + 0x2c);
+    bool     events = FALSE;
 
+    /* SMD state machine: mirror the guest's states onto ch1 like the RPM
+     * firmware would.  OPENING->OPENED; CLOSING->CLOSING (the guest's
+     * smd_irq_handler does the CLOSED transition itself and then marks the
+     * channel freed). */
+    if (ch0_state != s->last_ch0_state) {
+        s->last_ch0_state = ch0_state;
+        if (ch0_state == 1) {                       /* OPENING */
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x00, 2);  /* ch1 = OPENED */
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x1c, 1);  /* state_updated */
+            events = TRUE;
+            qemu_log("smdghost: ack OPENING -> OPENED\n");
+        } else if (ch0_state == 4) {                /* CLOSING */
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x00, 4);  /* ch1 = CLOSING */
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x1c, 1);  /* state_updated */
+            events = TRUE;
+            qemu_log("smdghost: mirror CLOSING on ch1\n");
+        } else if (ch0_state == 0 && s->last_ch0_state == 4) {
+            /* guest completed the CLOSED transition; one more IRQ makes its
+             * smd_irq_handler take the SignalEvent(smd_closed) branch */
+            events = TRUE;
+            qemu_log("smdghost: channel closed, re-pulse for event\n");
+        }
+    }
+
+    /* Drain outbound packets.  Both sides frame the stream with
+     * smd_pkt_hdr {pkt_size, app_field, app_ptr, kind, priority} (20 B)
+     * followed by pkt_size payload bytes (LK-era SMD packet mode). */
     if (ch0_wr != ch0_rd) {
-        /* new outbound packet(s): consume the whole outstanding range, then
-         * ACK it back on the reply half. */
-        smd_wr32(SMD_GHOST_CTRL_OFF + 0x24, ch0_wr);
-
-        {
-
-            /* the difference here is what we just consumed; we cannot know
-             * msg_id w/o parsing stream u8 data - peek at the fifo head. */
-            uint8_t hdr[20];
+        qemu_log("smdghost: drain wr=0x%x rd=0x%x\n", ch0_wr, ch0_rd);
+        uint32_t o = ch0_rd;
+        while ((int32_t)(ch0_wr - o) >= 20) {
+            uint8_t ph[20];
             address_space_read(&address_space_memory,
                                (hwaddr)(0x06A00000ULL) + SMD_GHOST_FIFO_OFF +
-                               (ch0_rd % SMD_GHOST_FIFO_HALF),
-                               MEMTXATTRS_UNSPECIFIED, hdr, sizeof(hdr));
-            /* Reply in the wire format UEFI SmdRpmDxe expects
-             * (rpm-smd.c): {rpm_gen_hdr = {type=0x00716572 'req',
-             * len=0x0C ACK_MSG_LENGTH}, then the msg id echoed}. */
-            uint32_t reply[5] = { 0x00716572u, 0x0Cu,
-                                  le32_to_cpu(*(uint32_t *)hdr), 0, 0 };
-            uint32_t ch1_wr = smd_rd32(SMD_GHOST_CTRL_OFF + 0x28 + 0x2c);
+                               (o % SMD_GHOST_FIFO_HALF),
+                               MEMTXATTRS_UNSPECIFIED, ph, 20);
+            uint32_t pkt_size = ldl_le_p((uint32_t *)ph);
+            if (pkt_size > SMD_GHOST_FIFO_HALF) {
+                qemu_log("smdghost: bad pkt_size 0x%x, resync\n", pkt_size);
+                break;
+            }
+            uint32_t pkt = 20 + pkt_size;
+            if ((int32_t)(ch0_wr - o) < (int32_t)pkt)
+                break;                              /* partial packet */
+            o += pkt;
+
+            /* ACK packet: smd_pkt_hdr{pkt_size=20,...} + 20 B ack body
+             * {rpm_gen_hdr{type, 0x0C ACK_MSG_LENGTH}, ...} — what
+             * rpm_smd_recv_data validates. */
+            uint32_t ack[10] = { 20, 0, 0, 0, 0, 0x00716572u, 0x0Cu, 0, 0, 0 };
+            if (pkt_size >= 44) {
+                uint8_t body[4];
+                address_space_read(&address_space_memory,
+                    (hwaddr)(0x06A00000ULL) + SMD_GHOST_FIFO_OFF +
+                    ((o - pkt_size + 20) % SMD_GHOST_FIFO_HALF),
+                    MEMTXATTRS_UNSPECIFIED, body, 4);
+                if (ldl_le_p((uint32_t *)body) == 0x00646d63u)  /* 'cmd' */
+                    ack[5] = 0x00646d63u;
+            }
+
             address_space_write(&address_space_memory,
                                 (hwaddr)(0x06A00000ULL) + SMD_GHOST_FIFO_OFF +
                                 SMD_GHOST_FIFO_HALF + (ch1_wr % SMD_GHOST_FIFO_HALF),
-                                MEMTXATTRS_UNSPECIFIED, reply, sizeof(reply));
-            ch1_wr += 20;
-            smd_wr32(SMD_GHOST_CTRL_OFF + 0x24 + 0x2c, ch1_wr);
+                                MEMTXATTRS_UNSPECIFIED, ack, sizeof(ack));
+            ch1_wr += 40;                            /* only write_index! */
             smd_wr32(SMD_GHOST_CTRL_OFF + 0x28 + 0x2c, ch1_wr);
-            /* signal + state_updated bits helped some readers */
-            smd_wr32(SMD_GHOST_CTRL_OFF + 0x1c + 0x2c, 1);
-            qemu_set_irq(s->irq, 1);
+            events = TRUE;
+        }
+        smd_wr32(SMD_GHOST_CTRL_OFF + 0x24, ch0_wr);  /* consumed */
+    }
+
+    /* Interrupt policy: the UEFI guest runs with IRQs masked most of the
+     * time, and a level-triggered SPI loses its pending state on the
+     * falling edge.  Hold the line high until the guest consumes the reply
+     * (ch1.read_index catches up) or the channel moves on. */
+    if (events) {
+        qemu_set_irq(s->irq, 1);
+        s->irq_asserted = TRUE;
+        s->last_reply_wr = ch1_wr;
+    } else if (s->irq_asserted) {
+        if (ch1_rd >= s->last_reply_wr || ch0_state == 4 || ch0_state == 0) {
             qemu_set_irq(s->irq, 0);
+            s->irq_asserted = FALSE;
         }
     }
 

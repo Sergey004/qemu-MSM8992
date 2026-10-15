@@ -302,8 +302,14 @@ static void arm_gic_common_reset_hold(Object *obj, ResetType type)
     }
 
     for (i = 0; i < GIC_MAXIRQ; i++) {
-        /* For uniprocessor GICs all interrupts always target the sole CPU */
+        /* For uniprocessor GICs all interrupts always target the sole CPU.
+         * For SMP: default every SPI to CPU0 — real boot firmware (QC SBL1
+         * et al) programs the distributor targets during bring-up; leaving
+         * them 0 (no target) silently drops every IRQ the guest enables
+         * without touching ITARGETSR. */
         if (s->num_cpu == 1) {
+            s->irq_target[i] = 1;
+        } else if (i >= GIC_INTERNAL) {
             s->irq_target[i] = 1;
         } else {
             s->irq_target[i] = 0;
