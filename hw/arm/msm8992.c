@@ -323,6 +323,8 @@ static void msm8992_create_stubs(MachineState *ms)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(apcs), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(apcs), 0, 0xF900D000);
 
+
+
     /*
      * Tier-1 register blocks the firmware touches on every boot.
      * LOG_UNIMP traces from these feeds the §9 gap registry (RESEARCH.md):
@@ -866,6 +868,16 @@ static void msm8992_init(MachineState *machine)
     msm8992_create_sdc1(s, gic_spi);
 
     msm8992_create_stubs(machine);
+
+    /* SMD ghost coprocessor: emulates the RPM side of the rpm_requests
+     * channel on SMEM; raises GIC INTID 200 (PcdSmdIrq used by SmdDxe). */
+    {
+        DeviceState *gh = qdev_new("msm8992-smd-ghost");
+        SysBusDevice *ghsbd;
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gh), &error_fatal);
+        ghsbd = SYS_BUS_DEVICE(gh);
+        sysbus_connect_irq(ghsbd, 0, gic_spi[168]);  /* SPI 168 = INTID 200 */
+    }
 
     /*
      * fullchain=on: boot the real chain (pblstub -> SBL1 -> TZ -> UEFI).

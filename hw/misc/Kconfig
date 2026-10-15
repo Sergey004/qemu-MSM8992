@@ -198,6 +198,9 @@ config MSM8992_MPM
 config MSM8992_APCS
     bool
 
+config MSM8992_SMDGHOST
+    bool
+
 config UNIMP
     bool
 

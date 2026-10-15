@@ -180,6 +180,7 @@ system_ss.add(when: 'CONFIG_AXIADO_CLK', if_true: files('axiado_clk.c'))
 
 system_ss.add(when: 'CONFIG_MSM8992_MPM', if_true: files('msm-mpm.c'))
 system_ss.add(when: 'CONFIG_MSM8992_APCS', if_true: files('msm8992-apcs.c'))
+system_ss.add(when: 'CONFIG_MSM8992_SMDGHOST', if_true: files('msm8992-smdghost.c'))
 
 system_ss.add(when: 'CONFIG_MSM8992_GCC', if_true: files('msm8992-gcc.c'))
 system_ss.add(when: 'CONFIG_MSM8992_TCSR', if_true: files('msm8992-tcsr.c'))
