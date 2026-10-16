@@ -511,6 +511,8 @@ static void msm8992_smem_store(uint8_t *ram, hwaddr off, uint32_t val)
     stl_le_p(ram + off, val);
 }
 
+static MemoryRegion *msm8992_imem_mr;
+
 static void msm8992_populate_smem(MachineState *ms)
 {
     uint8_t *ram = memory_region_get_ram_ptr(ms->ram);
@@ -683,6 +685,7 @@ static void msm8992_populate_smem(MachineState *ms)
     memory_region_init_ram(targ, NULL, "msm8992.imem", MSM8992_IMEM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), MSM8992_IMEM_BASE, targ);
+    msm8992_imem_mr = targ;
     {
         uint8_t *ti = memory_region_get_ram_ptr(targ);
         stl_le_p(ti + 0x5FF0 + 0, 0x49494953);        /* "SIII" identifier */
@@ -815,12 +818,46 @@ static void msm8992_stage_pbl_shared(MachineState *ms)
     stq_le_p(p + 0xC810, 0);                           /* hash_seg_hdr */
 
     /* cache_mmu_share_info (0xF000 page): version, page_tbl_base, size.
-     * Retail SBL1 reads *page_tbl_base as its TTBR0_EL3 and writes four
-     * 1GB identity block descriptors itself, so PBL only has to hand over
-     * an aligned, zeroed 4KB table area. */
+     * Retail SBL1 reads *page_tbl_base as its TTBR0_EL3 and rewrites the
+     * four 1GB identity block entries itself, but boot_mmu_map_region then
+     * swaps L1[3] for an L2 table @IMEM+0x1000 (0xFE801000) and writes into
+     * it through the MMU — so PBL must hand over an already-populated map
+     * (real PBL does): L1 blocks for RAM + L2 covering 0xC0000000+ with
+     * 2MB descriptors (attr4, same shape SBL1 builds: PA|0x711). */
     stl_le_p(p + 0xF000, 0x00010001);
     stq_le_p(p + 0xF008, MSM8992_PBL_SHARED + 0x10000); /* L1 table */
     stl_le_p(p + 0xF00C, 0x1000);                       /* table size */
+    {
+        uint64_t *l1 = (uint64_t *)(p + 0x10000);
+        uint64_t *l2;
+        int i;
+
+        memset(p + 0x10000, 0, 0x1000);
+        /* RAM blocks: 0x00000000-0xBFFFFFFF (3GB DRAM, device-less RW) */
+        l1[0] = 0x0000000000000411ULL;
+        l1[1] = 0x0000000040000411ULL;
+        l1[2] = 0x0000000080000411ULL;
+        /* 0xC0000000-0xFFFFFFFF: L2 table at IMEM+0x1000 (SBL1's own spot) */
+        l1[3] = 0x00000000FE801003ULL;
+
+        /* L2 (in IMEM ram, 512 x 2MB blocks over 0xC0000000-0xFFFFFFFF) */
+        l2 = (uint64_t *)memory_region_get_ram_ptr(msm8992_imem_mr)
+             + 0x1000 / sizeof(uint64_t);
+        for (i = 0; i < 512; i++) {
+             l2[i] = (0xC0000000ULL + ((uint64_t)i << 21)) | 0x711ULL;
+        }
+        /* SBL1 splits the IMEM 2MB (L2[0x1F4], VA 0xFE800000+) into 4KB
+         * pages via an L3 table @IMEM+0x2000; writes into it go through the
+         * MMU, so both levels must pre-exist (retail PBL fills them too). */
+        l2[0x1F4] = 0xFE802003ULL;               /* table -> L3 */
+        {
+            uint64_t *l3 = (uint64_t *)memory_region_get_ram_ptr(
+                               msm8992_imem_mr) + 0x2000 / sizeof(uint64_t);
+            for (i = 0; i < 512; i++) {
+                l3[i] = (0xFE800000ULL + ((uint64_t)i << 12)) | 0x713ULL;
+            }
+        }
+    }
 
     /* boot_flash_shared_dev_info_type (0xE000 page):
      * the phone boots from eMMC on SDC1; PBL records its probe result here. */
