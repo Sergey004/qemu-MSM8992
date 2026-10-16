@@ -48,6 +48,8 @@ config MSM8992
     select MSM8992_FB
     select MSM8992_MPM
     select MSM8992_QTIMER
+    select MSM8992_SPMI
+    select MSM8992_PRNG
     select MSM8992_GCC
     select MSM8992_TCSR
     select MSM8992_APCS

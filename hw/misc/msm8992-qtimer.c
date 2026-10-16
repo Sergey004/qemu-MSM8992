@@ -36,6 +36,8 @@ static uint64_t msm8992_qtimer_read(void *opaque, hwaddr offset, unsigned size)
     case 0x0000: return (uint32_t)(now & 0xFFFFFFFFu);   /* CNT low */
     case 0x0004: return (uint32_t)(now >> 32);           /* CNT high */
     case 0x0008: return s->ctrl;
+    case 0x1000: return (uint32_t)(now & 0xFFFFFFFFu);   /* frame0 CNTCV low */
+    case 0x1004: return (uint32_t)(now >> 32);           /* frame0 CNTCV high */
     default:
         return 0;
     }

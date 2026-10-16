@@ -309,6 +309,28 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi)
 
 #define MSM8992_MPM_BASE 0xFC4A1000ULL
 
+/*
+ * Low-memory scratch window (0x0..0x10000). Retail SBL1 derives the SPMI
+ * arbiter MMIO base from devcfg, which our boot does not provide yet; with
+ * a NULL base its channel writes land at 0xF810+ch*0x80 and abort. This
+ * window catches them (logged) so PMIC init proceeds until devcfg support
+ * lands. Nothing the machine loads occupies this range (stub is at
+ * 0x10000, PBL shared data at 0x80000).
+ */
+static uint64_t msm8992_low_scratch_read(void *opaque, hwaddr addr, unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "low-scratch: read  (size %d, offset 0x%04llx)\n",
+                  size, (unsigned long long)addr);
+    return 0;
+}
+
+static void msm8992_low_scratch_write(void *opaque, hwaddr addr, uint64_t val,
+                                      unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "low-scratch: write (size %d, offset 0x%04llx, value 0x%08llx)\n",
+                  size, (unsigned long long)addr, (unsigned long long)val);
+}
+
 static void msm8992_create_stubs(MachineState *ms)
 {
     /* MPM2: sleep-wake timer + PS_HOLD (stock firmware polls it for delays) */
@@ -346,8 +368,33 @@ static void msm8992_create_stubs(MachineState *ms)
      */
     create_unimplemented_device("qgic-adjacent", 0xF9000000ULL, 0x113000);
 
+    {
+        static const MemoryRegionOps low_scratch_ops = {
+            .read = msm8992_low_scratch_read,
+            .write = msm8992_low_scratch_write,
+            .endianness = DEVICE_LITTLE_ENDIAN,
+            .impl.min_access_size = 1,
+            .impl.max_access_size = 8,
+        };
+        MemoryRegion *ls = g_new(MemoryRegion, 1);
+        memory_region_init_io(ls, NULL, &low_scratch_ops, NULL,
+                              "msm8992.low-scratch", 0x10000);
+        memory_region_add_subregion(get_system_memory(), 0x0ULL, ls);
+    }
+
     create_unimplemented_device("tlmm",      MSM8992_TLMM_BASE,  0x4000);
-    create_unimplemented_device("spmi-pmic", MSM8992_SPMI_BASE, 0x10000);
+    {
+        DeviceState *sp;
+        sp = qdev_new("msm8992-spmi");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(sp), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(sp), 0, MSM8992_SPMI_BASE);
+    }
+    {
+        DeviceState *pr;
+        pr = qdev_new("msm8992-prng");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(pr), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(pr), 0, 0xF9BFF000ULL);
+    }
     create_unimplemented_device("sec-trust-ctrl", 0xFC4B8000, 0x7000);
     create_unimplemented_device("rpm-msgram", MSM8992_RPM_MSGRAM, 0x4000);
     {
@@ -364,6 +411,10 @@ static void msm8992_create_stubs(MachineState *ms)
 
     /* Tier-2/3 placeholders */
     create_unimplemented_device("mmss-lo",   0xFD800000ULL, 0xC0000);
+    /* BIMC / DDR PHY window (msm8992 dtsi: bimc@fc380000): SBL1's DDR
+     * driver runs its LPDDR3 training against these registers. Reads-as-0
+     * for now; every access is logged for the DDR contract extraction. */
+    create_unimplemented_device("bimc",      0xFC380000ULL, 0x20000);
     create_unimplemented_device("vbif",      0xFD8C0000ULL, 0x40000);
     create_unimplemented_device("kgsl-3d0",  MSM8992_KGSL_BASE, 0x10000);
     create_unimplemented_device("mdp5",      MSM8992_MDP5_BASE, 0xB4000);
@@ -726,24 +777,31 @@ static void msm8992_stage_pbl_shared(MachineState *ms)
 
     memset(p, 0, 0x1000);
     stl_le_p(p + 0x00, 0x00010001); /* shared_data_version (v2) */
-    stl_le_p(p + 0x04, 0);          /* pbl_version */
-    stl_le_p(p + 0x08, 0);          /* pbl_patch_version */
-    stl_le_p(p + 0x0C, 0);          /* boot_option */
+    /* +0x08 (qword): retail SBL1 main_ctl reads [pbl_shared+8] as the
+     * boot_mmu_enable argument — the L1 identity page-table base. */
+    stq_le_p(p + 0x08, MSM8992_PBL_SHARED + 0x10000);
     stl_le_p(p + 0x10, 0);          /* bl_loader_auth_enabled */
     stl_le_p(p + 0x14, 1);          /* hash_integrity_check_disabled */
     stl_le_p(p + 0x18, 1);          /* bl_sec_boot_flow_supported */
     stl_le_p(p + 0x1C, 1);          /* bl_sec_auth_disabled */
     stq_le_p(p + 0x20, MSM8992_PBL_SHARED + 0x4000); /* boot_stack_base */
     stl_le_p(p + 0x28, 0x4000);     /* boot_stack_size */
-    /* reserved_fields_bl[32] zero; nested pointers point at spare pages */
-    stq_le_p(p + 0xB0,  MSM8992_PBL_SHARED + 0x8000);  /* timestamps */
-    stq_le_p(p + 0xB8,  MSM8992_PBL_SHARED + 0x9000);  /* bl_shared_data */
-    stq_le_p(p + 0xC0,  MSM8992_PBL_SHARED + 0xA000);  /* pbl_clock_shared_data */
-    stq_le_p(p + 0xC8,  MSM8992_PBL_SHARED + 0xB000);  /* elf_img_shared_info */
-    stq_le_p(p + 0xD0,  MSM8992_PBL_SHARED + 0xC000);  /* secboot_shared_data */
-    stq_le_p(p + 0xD8,  MSM8992_PBL_SHARED + 0xD000);  /* pcie_bhi_shared_info */
-    stq_le_p(p + 0xE0,  MSM8992_PBL_SHARED + 0xE000);  /* flash_shared_data */
-    stq_le_p(p + 0xF0,  MSM8992_PBL_SHARED + 0xF000);  /* cache_mmu_share_data */
+    /* Retail SBL1 contract (Ghidra FUN_fec06408 @0xFEC06408): struct is
+     * 0x68 bytes; +0x40 -> 0x58B sub-struct, +0x48 -> flash shared
+     * (asserted non-NULL; head {q,q,u32,0x2C} rebuilt at 0xFECae588),
+     * +0x50 clock, +0x58 elf_img, +0x60 secboot. */
+    stq_le_p(p + 0x40, MSM8992_PBL_SHARED + 0x8000);  /* timestamps page */
+    stq_le_p(p + 0x48, MSM8992_PBL_SHARED + 0xE000);  /* flash shared */
+    stq_le_p(p + 0x50, MSM8992_PBL_SHARED + 0xA000);  /* pbl_clock_shared_data */
+    stq_le_p(p + 0x58, MSM8992_PBL_SHARED + 0xB000);  /* elf_img_shared_info */
+    stq_le_p(p + 0x60, MSM8992_PBL_SHARED + 0xC000);  /* secboot_shared_data */
+
+    /* timestamps page (0x8000, 0x58B): version + zeroed milestone ticks */
+    stl_le_p(p + 0x8000, 0x00010000);
+
+    /* pbl_clock_shared_data (0xA000 page): {nVersionInfo, nProcSpeedMHz} */
+    stl_le_p(p + 0xA000, 0x00010000);
+    stl_le_p(p + 0xA004, 1248); /* MHz, A53 cluster reset speed */
 
     /* pbl_elf_img_share_info_type (0xB000 page): version + meta ptr */
     stl_le_p(p + 0xB000, 0x00010000);                 /* shared_data_version */
@@ -756,8 +814,13 @@ static void msm8992_stage_pbl_shared(MachineState *ms)
     stq_le_p(p + 0xC808, MSM8992_PBL_SHARED + 0xCA00); /* prog_hdr */
     stq_le_p(p + 0xC810, 0);                           /* hash_seg_hdr */
 
-    /* cache_mmu_share_info (0xF000 page): version, page_tbl_base=0, size=0 */
+    /* cache_mmu_share_info (0xF000 page): version, page_tbl_base, size.
+     * Retail SBL1 reads *page_tbl_base as its TTBR0_EL3 and writes four
+     * 1GB identity block descriptors itself, so PBL only has to hand over
+     * an aligned, zeroed 4KB table area. */
     stl_le_p(p + 0xF000, 0x00010001);
+    stq_le_p(p + 0xF008, MSM8992_PBL_SHARED + 0x10000); /* L1 table */
+    stl_le_p(p + 0xF00C, 0x1000);                       /* table size */
 
     /* boot_flash_shared_dev_info_type (0xE000 page):
      * the phone boots from eMMC on SDC1; PBL records its probe result here. */

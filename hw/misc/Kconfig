@@ -186,6 +186,12 @@ config AUX
 config MSM8992_QTIMER
     bool
 
+config MSM8992_SPMI
+    bool
+
+config MSM8992_PRNG
+    bool
+
 config MSM8992_GCC
     bool
 
