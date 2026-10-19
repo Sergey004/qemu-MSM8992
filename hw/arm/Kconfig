@@ -47,7 +47,7 @@ config MSM8992
     select MSM_UARTDM
     select MSM8992_FB
     select MSM8992_MPM
-    select MSM8992_QTIMER
+    select HEX_QTIMER
     select MSM8992_SPMI
     select MSM8992_PRNG
     select MSM8992_GCC
@@ -55,6 +55,7 @@ config MSM8992
     select MSM8992_APCS
     select MSM8992_SMDGHOST
     select SDHCI
+    select PL181
     select UNIMP
 
 config CUBIEBOARD

@@ -185,6 +185,5 @@ system_ss.add(when: 'CONFIG_MSM8992_SMDGHOST', if_true: files('msm8992-smdghost.
 system_ss.add(when: 'CONFIG_MSM8992_GCC', if_true: files('msm8992-gcc.c'))
 system_ss.add(when: 'CONFIG_MSM8992_TCSR', if_true: files('msm8992-tcsr.c'))
 
-system_ss.add(when: 'CONFIG_MSM8992_QTIMER', if_true: files('msm8992-qtimer.c'))
 system_ss.add(when: 'CONFIG_MSM8992_SPMI', if_true: files('msm8992-spmi.c'))
 system_ss.add(when: 'CONFIG_MSM8992_PRNG', if_true: files('msm8992-prng.c'))

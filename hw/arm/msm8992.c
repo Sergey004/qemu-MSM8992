@@ -44,6 +44,7 @@
 #include "hw/misc/unimp.h"
 #include "system/system.h"
 #include "hw/sd/sdhci.h"
+#include "hw/timer/qct-qtimer.h"
 #include "target/arm/cpu-qom.h"
 #include "target/arm/cpu.h"
 #include "target/arm/gtimer.h"
@@ -248,21 +249,33 @@ static void msm8992_create_uart(Msm8992MachineState *s, qemu_irq *gic_spi)
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, gic_spi[MSM8992_UART2_IRQ]);
 }
 
-static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi)
+static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
+                                bool fullchain)
 {
     SysBusDevice *sbd;
+    DeviceState *sdc1_host;
 
-    /* eMMC boot device; attach the pre-flashed GPT image via -drive if=sd */
-    s->sdc1 = qdev_new(TYPE_SYSBUS_SDHCI);
-    sbd = SYS_BUS_DEVICE(s->sdc1);
-    sysbus_realize_and_unref(sbd, &error_fatal);
-    sysbus_mmio_map(sbd, 0, MSM8992_SDC1_BASE);
-    sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
-    /* QC's SDHCI vendor registers extend past the generic 0x100 window */
-    create_unimplemented_device("sdc1-pad", MSM8992_SDC1_BASE, 0x1000);
-
-    /* Qualcomm core-config window in front of the SDHCI regs */
-    create_unimplemented_device("sdhc1-vendor-cfg", MSM8992_SDC1_CONF, 0x800);
+    /* eMMC boot device; attach the pre-flashed GPT image via -drive if=sd.
+     * Two register banks on the same controller: legacy MCI (PL181-like)
+     * @0xF9824000 (retail SBL1's path) and SDHCI @0xF9824900 (UEFI's path).
+     * Only one host is instantiated per lane since they share the card. */
+    if (fullchain) {
+        sdc1_host = qdev_new("pl181");
+        sbd = SYS_BUS_DEVICE(sdc1_host);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, MSM8992_SDC1_CONF);
+        sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
+    } else {
+        sdc1_host = s->sdc1 = qdev_new(TYPE_SYSBUS_SDHCI);
+        sbd = SYS_BUS_DEVICE(sdc1_host);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, MSM8992_SDC1_BASE);
+        sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
+        /* QC's SDHCI vendor registers extend past the generic 0x100 window */
+        create_unimplemented_device("sdc1-pad", MSM8992_SDC1_BASE, 0x1000);
+        create_unimplemented_device("sdhc1-vendor-cfg", MSM8992_SDC1_CONF,
+                                    0x800);
+    }
     create_unimplemented_device("sdhc2-vendor-cfg", 0xF98A4000ULL, 0x900);
 
     /* SDC1 endpoint is the on-board eMMC */
@@ -275,7 +288,7 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi)
             qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(dinfo),
                                     &error_fatal);
             if (!qdev_realize(DEVICE(card),
-                              BUS(qdev_get_child_bus(s->sdc1, "sd-bus")),
+                              BUS(qdev_get_child_bus(sdc1_host, "sd-bus")),
                               &error_fatal))
                 g_assert_not_reached();
         }
@@ -383,6 +396,12 @@ static void msm8992_create_stubs(MachineState *ms)
     }
 
     create_unimplemented_device("tlmm",      MSM8992_TLMM_BASE,  0x4000);
+    /* WDT0 kick/bite regs @0xFD41A000 (SBL1 boot-mark writes land at
+     * +0x400; unmodeled WDT would abort the pet path mid-boot) */
+    create_unimplemented_device("wdt0",      0xFD41A000ULL,      0x1000);
+    /* CRYPTO0/1 engines (SBL1 initializes them for secboot) */
+    create_unimplemented_device("crypto0",   0xFD404000ULL,      0x1C000);
+    create_unimplemented_device("crypto1",   0xFD444000ULL,      0x1C000);
     {
         DeviceState *sp;
         sp = qdev_new("msm8992-spmi");
@@ -398,10 +417,24 @@ static void msm8992_create_stubs(MachineState *ms)
     create_unimplemented_device("sec-trust-ctrl", 0xFC4B8000, 0x7000);
     create_unimplemented_device("rpm-msgram", MSM8992_RPM_MSGRAM, 0x4000);
     {
+        /*
+         * Qualcomm Cortex Timer (QCT-QTIMER, the model from the official
+         * Qualcomm QEMU tree). Two MMIO windows: the access-control block
+         * (CNTFRQ/CNTSR/CNTTID/CNTACR/VERSION) and the timer frames
+         * (CNTPCT/CNTP_CVAL/CNTP_TVAL/CNTP_CTL). SBL1 polls the frame-0
+         * physical counter at 0xF9021000, so the frame window starts there
+         * and the AC block sits right below it.
+         */
         DeviceState *qt;
-        qt = qdev_new("msm8992-qtimer");
+        qt = qdev_new(TYPE_QCT_QTIMER);
+        qdev_prop_set_uint32(qt, "freq-hz", 19200000);
+        qdev_prop_set_uint32(qt, "freq-scale", 1);
+        qdev_prop_set_uint32(qt, "nr_frames", 8);
+        qdev_prop_set_uint32(qt, "nr_views", 1);
+        qdev_prop_set_uint32(qt, "frame_stride", 0x1000);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(qt), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(qt), 0, MSM8992_QTIMER_F0 - 0x1000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(qt), 1, MSM8992_QTIMER_F0);
     }
     {
         DeviceState *fb;
@@ -688,6 +721,11 @@ static void msm8992_populate_smem(MachineState *ms)
     msm8992_imem_mr = targ;
     {
         uint8_t *ti = memory_region_get_ram_ptr(targ);
+        /* boot_flash_dev_if: PBL's IMEM flash-type cookie. Retail SBL1
+         * reads *(int*)0xFE80F838 (sbl_shared->+0x40 -> here) as
+         * boot_flash_type to dispatch boot_flash_dev_sdcc registration;
+         * 0 = NO_FLASH skips it and lock_singleton later asserts 300d. */
+        stl_le_p(ti + 0xF838, 4);                     /* SDC_FLASH */
         stl_le_p(ti + 0x5FF0 + 0, 0x49494953);        /* "SIII" identifier */
         stl_le_p(ti + 0x5FF0 + 4, MSM8992_SMEM_SIZE);
         stl_le_p(ti + 0x5FF0 + 8, (uint32_t)MSM8992_SMEM_BASE);
@@ -793,14 +831,33 @@ static void msm8992_stage_pbl_shared(MachineState *ms)
      * 0x68 bytes; +0x40 -> 0x58B sub-struct, +0x48 -> flash shared
      * (asserted non-NULL; head {q,q,u32,0x2C} rebuilt at 0xFECae588),
      * +0x50 clock, +0x58 elf_img, +0x60 secboot. */
-    stq_le_p(p + 0x40, MSM8992_PBL_SHARED + 0x8000);  /* timestamps page */
-    stq_le_p(p + 0x48, MSM8992_PBL_SHARED + 0xE000);  /* flash shared */
+    stq_le_p(p + 0x40, MSM8992_PBL_SHARED + 0xD000);  /* flash shared (retail: type-first) */
+    stq_le_p(p + 0x48, MSM8992_PBL_SHARED + 0xE000);  /* qsee iface head copy */
     stq_le_p(p + 0x50, MSM8992_PBL_SHARED + 0xA000);  /* pbl_clock_shared_data */
     stq_le_p(p + 0x58, MSM8992_PBL_SHARED + 0xB000);  /* elf_img_shared_info */
     stq_le_p(p + 0x60, MSM8992_PBL_SHARED + 0xC000);  /* secboot_shared_data */
 
-    /* timestamps page (0x8000, 0x58B): version + zeroed milestone ticks */
-    stl_le_p(p + 0x8000, 0x00010000);
+    /* Retail boot_flash_dev_if contract: pbl_shared+0x40 struct starts with
+     * boot_flash_type (boot_flash_init reads *(int*)it to dispatch SDCC
+     * registration; the 3.3-header version-first layout makes the dispatcher
+     * silently skip and lock_singleton later asserts 300d). */
+    stl_le_p(p + 0xD000, 5);                          /* type = MMC_FLASH (eMMC on SDCC1) */
+    stl_le_p(p + 0xD004, 0xF9824000);                 /* CS_base: SDCC1 */
+    stl_le_p(p + 0xD008, 8);                          /* data_width */
+    stl_le_p(p + 0xD00C, 0);                          /* ctrl_type */
+    /* dev_info.sdc */
+    stl_le_p(p + 0xD010, 0);          /* mem */
+    stl_le_p(p + 0xD014, 4);          /* card_type */
+    stl_le_p(p + 0xD018, 2);          /* card_state: standby */
+    stl_le_p(p + 0xD01C, 2);          /* rca */
+    stl_le_p(p + 0xD020, 200000000);  /* mclk */
+    stl_le_p(p + 0xD024, 0);          /* port: SDC1 */
+    stl_le_p(p + 0xD028, 0);          /* boot_cfg */
+    stl_le_p(p + 0xD02C, 2);          /* data_width: 8-bit */
+    stl_le_p(p + 0xD030, 1);          /* is_gpt_parti */
+    stl_le_p(p + 0xD034, 1);          /* is_primary_table */
+    stq_le_p(p + 0xD038, 0x0001A000); /* starting_lba: SBL1 */
+    stq_le_p(p + 0xD040, 0x0001A7FF); /* ending_lba */
 
     /* pbl_clock_shared_data (0xA000 page): {nVersionInfo, nProcSpeedMHz} */
     stl_le_p(p + 0xA000, 0x00010000);
@@ -935,6 +992,23 @@ static void msm8992_init(MachineState *machine)
         memory_region_init_ram(r, NULL, "msm8992.rpm-coderam", 0x100000,
                                &error_fatal);
         memory_region_add_subregion(get_system_memory(), 0xFC100000, r);
+
+        /*
+         * PMIC PSI (Power Sequence Information) header in RPM code RAM at
+         * SCL_PMIC_CONFIG_BUF_BASE. Retail SBL1's pm_device_init walks this
+         * table (magic "PSI_" + table pointer, 20-byte entries, type 4 =
+         * END). On hardware the PMIC image's PDM data supplies it; the
+         * sequence itself only programs regulator registers, which the fake
+         * bus ignores, so a terminator-only table keeps the walk happy.
+         */
+        {
+            uint8_t *rp = memory_region_get_ram_ptr(r);
+            uint32_t psi_base = 0xA080;   /* 0xFC10A080 */
+            stl_le_p(rp + psi_base, 0x5F495350);            /* "PSI_" magic */
+            stl_le_p(rp + psi_base + 8, 0xFC10A0A0);        /* entry table */
+            stl_le_p(rp + psi_base + 0xC, 0xFC10A0C0);      /* reg-off table */
+            stl_le_p(rp + psi_base + 0x28, 4);              /* entry type END */
+        }
     }
     {
         MemoryRegion *r = g_new(MemoryRegion, 1);
@@ -965,7 +1039,7 @@ static void msm8992_init(MachineState *machine)
     }
 
     msm8992_create_uart(s, gic_spi);
-    msm8992_create_sdc1(s, gic_spi);
+    msm8992_create_sdc1(s, gic_spi, s->fullchain);
 
     msm8992_create_stubs(machine);
 
