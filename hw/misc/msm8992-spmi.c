@@ -70,6 +70,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992SpmiState, MSM8992_SPMI)
 #define PMIC_REG_PBS_ADDR  0x7042  /* RAM address, 2 bytes */
 #define PMIC_REG_PBS_WDATA 0x7048  /* RAM write port */
 #define PMIC_REG_PBS_RDATA 0x704C  /* RAM read port (echo of last write) */
+/* PMI8994 status registers the OEM/charger config path polls while
+ * waiting for the device to become ready (bit 0 = "ready"). */
+#define PMIC_REG_CHG_STAT1 0x4410
+#define PMIC_REG_CHG_STAT2 0x4440
+/* Charger status: the retail battery driver reads this byte twice and
+ * decodes it twice (bits 3..5 = "shutdown reason", bits 0..2 = "charger
+ * state"), so both fields must be non-zero for the driver to continue
+ * to UEFI instead of aborting with "No charger shut down". */
+#define PMIC_REG_CHG_STAT3 0x130D
 
 typedef struct Msm8992SpmiState {
     SysBusDevice parent_obj;
@@ -112,6 +121,7 @@ static int msm8992_pmic_slot(unsigned sid)
 #define PMIC_TYPE_MPP        0x11
 #define PMIC_TYPE_ADC        0x08   /* generic peripheral, no registrar */
 #define PMIC_TYPE_CHARGER    0x02   /* registers the per-PMIC rail device */
+#define PMIC_TYPE_FG         0x0d   /* registers the per-PMIC charger/OEM device */
 
 static uint8_t msm8992_pmic_page_type(unsigned sid, unsigned page)
 {
@@ -124,6 +134,12 @@ static uint8_t msm8992_pmic_page_type(unsigned sid, unsigned page)
         /* CHARGER only on the companion PMI8994 (slave 2): this is the path
          * that registers the per-PMIC railway/rail device (FUN_fec3ebe4). */
         return (sid == 2) ? PMIC_TYPE_CHARGER : 0;
+    case 0x1400:
+        /* Fuel-gauge class peripheral on the companion PMI8994: the retail
+         * per-page dispatch routes type 0x0D to the registrar that creates
+         * the per-PMIC device object used by the OEM/charger config path
+         * (pm_driver_init -> FUN_fec24b40). */
+        return (sid == 2) ? PMIC_TYPE_FG : 0;
     case 0x7000: return PMIC_TYPE_PBS;
     default:     return 0;
     }
@@ -199,6 +215,9 @@ static uint8_t msm8992_pmic_read_byte(Msm8992SpmiState *s, unsigned sid,
     case PMIC_REG_ANA_MINOR: return 0x01;   /* metal revision */
     case PMIC_REG_ANA_MAJOR: return 0x02;   /* all-layer revision */
     case PMIC_REG_PON_DIGM:  return 0x00;
+    case PMIC_REG_CHG_STAT1: return 0x01;   /* "ready" bit polled by the driver */
+    case PMIC_REG_CHG_STAT2: return 0x01;
+    case PMIC_REG_CHG_STAT3: return 0x09;
     case PMIC_REG_PON_SUB:   return 0x08;
     case PMIC_REG_PBS_SUB:   return 0x01;
     default:                 return 0;
