@@ -55,6 +55,7 @@ config MSM8992
     select MSM8992_TCSR
     select MSM8992_APCS
     select MSM8992_SMDGHOST
+    select MSM8992_SDCC
     select SDHCI
     select PL181
     select UNIMP

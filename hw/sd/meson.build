@@ -1,4 +1,5 @@
 system_ss.add(when: 'CONFIG_PL181', if_true: files('pl181.c'))
+system_ss.add(when: 'CONFIG_MSM8992_SDCC', if_true: files('msm8992-sdcc.c'))
 system_ss.add(when: 'CONFIG_SD', if_true: files('sd.c', 'core.c'))
 system_ss.add(when: 'CONFIG_SDHCI', if_true: files('sdhci.c'))
 system_ss.add(when: 'CONFIG_SDHCI_PCI', if_true: files('sdhci-pci.c'))
