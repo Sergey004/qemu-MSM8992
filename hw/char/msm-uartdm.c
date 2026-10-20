@@ -67,6 +67,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmUartDmState, MSM_UARTDM)
 #define UARTDM_BCR        0xC8
 #define UARTDM_RXTCTRL    0xCC
 
+/*
+ * 0x44 (TWC) is the TX FIFO depth reported by the hardware; the stock
+ * SBL1 UART driver computes "free space" as (TWC & ~3) - (TXFS count)
+ * and spins forever if the register reads back zero.  The register is
+ * read-only in the real part, so the driver's write to it is dropped.
+ */
+#define UARTDM_TX_FIFO_DEPTH 0x20
+
 /* SR bits (msm_serial.h) */
 #define SR_HUNT_CHAR      (1 << 7)
 #define SR_RX_BREAK       (1 << 6)
@@ -179,7 +187,7 @@ static uint64_t msm_uartdm_read(void *opaque, hwaddr offset, unsigned size)
     case UARTDM_RXTSNAP: return fifo8_num_used(&s->rx_fifo);
     case UARTDM_DMEN:    return s->dmen;
     case UARTDM_NCF_TX:  return s->ncf_tx;
-    case UARTDM_BADR:    return s->badr;
+    case UARTDM_BADR:    return UARTDM_TX_FIFO_DEPTH;
     case UARTDM_TXFS:    return 0;               /* TX FIFO empty */
     case UARTDM_RXFS:    return fifo8_num_used(&s->rx_fifo);
     case UARTDM_SIM_CFG: return s->sim_cfg;
@@ -196,6 +204,11 @@ static void msm_uartdm_write(void *opaque, hwaddr offset, uint64_t value,
                              unsigned size)
 {
     MsmUartDmState *s = MSM_UARTDM(opaque);
+
+    if (offset >= 0x40 && offset <= 0x50) {
+        qemu_log_mask(LOG_UNIMP, "msm-uartdm: write 0x%02" HWADDR_PRIx
+                      " = 0x%08" PRIx64 "\n", offset, value);
+    }
 
     switch (offset) {
     case UARTDM_MR1: s->mr1 = value; break;
@@ -232,6 +245,8 @@ static void msm_uartdm_write(void *opaque, hwaddr offset, uint64_t value,
     case 0x104:
     case 0x108:
     case 0x10C: {
+        qemu_log_mask(LOG_UNIMP, "msm-uartdm: tx 0x%02" HWADDR_PRIx
+                      " = 0x%08" PRIx64 "\n", offset, value);
         if (s->tx_enabled && qemu_chr_fe_backend_connected(&s->chr)) {
             /*
              * Real FIFO words are 4 bytes; polling writers (msm earlycon /
@@ -260,7 +275,7 @@ static void msm_uartdm_write(void *opaque, hwaddr offset, uint64_t value,
     case UARTDM_DMRX:    s->dmrx = value; break;
     case UARTDM_DMEN:    s->dmen = value; break;
     case UARTDM_NCF_TX:  s->ncf_tx = value; break;
-    case UARTDM_BADR:    s->badr = value; break;
+    case UARTDM_BADR:    s->badr = value; break;  /* read-only in HW */
     case UARTDM_SIM_CFG: s->sim_cfg = value; break;
     case UARTDM_BCR:     s->bcr = value; break;
     case UARTDM_RXTCTRL: s->rxtctrl = value; break;

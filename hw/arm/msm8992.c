@@ -238,6 +238,40 @@ static void msm8992_create_gic(Msm8992MachineState *s, MachineState *ms)
     }
 }
 
+/*
+ * RPM clock-request state words.  The stock ClockLib writes an enable
+ * request (bit1) and waits for the RPM to acknowledge it by setting
+ * bit31; a finished request (bit0 set) is not acknowledged again.
+ */
+static uint64_t msm8992_rpm_clk_read(void *opaque, hwaddr offset,
+                                      unsigned size)
+{
+    uint32_t *regs = opaque;
+    uint32_t v = regs[offset >> 2];
+
+    if ((offset == 0x1000 || offset == 0x5000) &&
+        (v & 0x2) && !(v & 0x1)) {
+        v |= 0x80000000u;
+    }
+    return v;
+}
+
+static void msm8992_rpm_clk_write(void *opaque, hwaddr offset, uint64_t value,
+                                  unsigned size)
+{
+    uint32_t *regs = opaque;
+
+    regs[offset >> 2] = value;
+}
+
+static const MemoryRegionOps msm8992_rpm_clk_ops = {
+    .read = msm8992_rpm_clk_read,
+    .write = msm8992_rpm_clk_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static void msm8992_create_uart(Msm8992MachineState *s, qemu_irq *gic_spi)
 {
     /* DBG2 console: UARTDM (qcom,msm-lsuart-v14), minimal model in
@@ -1039,6 +1073,55 @@ static void msm8992_init(MachineState *machine)
                                &error_fatal);
         memory_region_add_subregion_overlap(get_system_memory(),
                                             0xE0000000, r, 0);
+    }
+
+    /*
+     * RPM shared RAM windows the stock ClockLib touches during
+     * boot_pre_ddr_clock_init() (sbl1_hw.c: "Pre_DDR_clock_init"):
+     *
+     *  - 0xF9011000 / 0xF9015000: the "clock request" structures the
+     *    SBL1 hands to the RPM.  Word 0 is the request/state word: the
+     *    driver writes the enable sequence (2 -> 6 -> 7) and then waits
+     *    for the RPM firmware to set bit31 ("the switch has completed").
+     *    The stock ClockLib also refuses to configure a clock whose
+     *    state word still has bit31 set or bits[2:0] == 7, so the RPM
+     *    side is emulated here: a pending request is acknowledged
+     *    immediately, and the acknowledgement disappears once the driver
+     *    writes the final "on" value.
+     *
+     *  - 0xF9112000: the DSB word the RPM clock request is written to.
+     */
+    {
+        static const uint32_t clock_domain[] = {
+            0x00000000,   /* +0x00 request/state word                  */
+            0x00000000,   /* +0x04                                    */
+            0x00000000,   /* +0x08                                    */
+            0x00000000,   /* +0x0C                                    */
+            0x00000000,   /* +0x10                                    */
+            0x00000000,   /* +0x14                                    */
+            0x00000000,   /* +0x18                                    */
+            0x00000000,   /* +0x1C                                    */
+            0x00000000,   /* +0x20                                    */
+            0x00000000,   /* +0x24                                    */
+            0x00000000,   /* +0x28                                    */
+            0x00000000,   /* +0x2C                                    */
+        };
+        MemoryRegion *r = g_new(MemoryRegion, 1);
+        uint32_t *regs = g_new0(uint32_t, 0x10000 / 4);
+
+        memory_region_init_io(r, NULL, &msm8992_rpm_clk_ops,
+                              regs, "msm8992.rpm-clk-ram", 0x10000);
+        memory_region_add_subregion(get_system_memory(), 0xF9010000, r);
+        for (unsigned j = 0; j < ARRAY_SIZE(clock_domain); j++) {
+            regs[(0x1000 >> 2) + j] = clock_domain[j];
+            regs[(0x5000 >> 2) + j] = clock_domain[j];
+        }
+    }
+    {
+        MemoryRegion *r = g_new(MemoryRegion, 1);
+        memory_region_init_ram(r, NULL, "msm8992.rpm-dsb", 0x1000,
+                               &error_fatal);
+        memory_region_add_subregion(get_system_memory(), 0xF9112000, r);
     }
 
     msm8992_create_uart(s, gic_spi);
