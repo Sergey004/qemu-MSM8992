@@ -50,7 +50,21 @@ struct Msm8992SmdGhostState {
     bool         irq_asserted;
     uint32_t     last_reply_wr;
     uint64_t     reply_serial;
+    unsigned     reassert_ticks;
 };
+
+/* Number of ticks the SMD IRQ line is kept low before it is raised again.
+ *
+ * The guest's GIC does not re-trigger an interrupt whose level stays high,
+ * so every event the guest has to see must arrive as a real rising edge:
+ * the line is dropped for a moment and raised again on a later tick.
+ *
+ * This matters for the channel close: smd_uninit() blocks in
+ * gBS->WaitForEvent(smd_closed), and the guest only signals that event from
+ * its SMD interrupt handler when the handler is entered with
+ * current_state == SMD_SS_CLOSED - i.e. it needs one more interrupt after it
+ * has written SMD_SS_CLOSED itself. */
+#define SMD_GHOST_REASSERT_TICKS 2
 
 static inline uint32_t smd_rd32(hwaddr off)
 {
@@ -85,6 +99,8 @@ static void msm8992_smd_ghost_tick(void *opaque)
      * smd_irq_handler does the CLOSED transition itself and then marks the
      * channel freed). */
     if (ch0_state != s->last_ch0_state) {
+        uint32_t prev_ch0_state = s->last_ch0_state;
+
         s->last_ch0_state = ch0_state;
         if (ch0_state == 1) {                       /* OPENING */
             smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x00, 2);  /* ch1 = OPENED */
@@ -96,10 +112,16 @@ static void msm8992_smd_ghost_tick(void *opaque)
             smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x1c, 1);  /* state_updated */
             events = TRUE;
             qemu_log("smdghost: mirror CLOSING on ch1\n");
-        } else if (ch0_state == 0 && s->last_ch0_state == 4) {
-            /* guest completed the CLOSED transition; one more IRQ makes its
-             * smd_irq_handler take the SignalEvent(smd_closed) branch */
-            events = TRUE;
+        } else if (ch0_state == 0 && prev_ch0_state == 4) {
+            /* The guest completed the CLOSED transition.  Its handler only
+             * signals "smd_closed" when it is entered again with
+             * current_state == CLOSED, so it needs one more interrupt - and
+             * that one has to be a real rising edge. */
+            if (s->irq_asserted) {
+                qemu_set_irq(s->irq, 0);
+                s->irq_asserted = FALSE;
+            }
+            s->reassert_ticks = SMD_GHOST_REASSERT_TICKS;
             qemu_log("smdghost: channel closed, re-pulse for event\n");
         }
     }
@@ -151,18 +173,33 @@ static void msm8992_smd_ghost_tick(void *opaque)
         smd_wr32(SMD_GHOST_CTRL_OFF + 0x24, ch0_wr);  /* consumed */
     }
 
-    /* Interrupt policy: the UEFI guest runs with IRQs masked most of the
-     * time, and a level-triggered SPI loses its pending state on the
-     * falling edge.  Hold the line high until the guest consumes the reply
-     * (ch1.read_index catches up) or the channel moves on. */
+    /* Interrupt policy: every event the guest has to see has to arrive as a
+     * real rising edge (our GIC does not re-trigger a level that stays
+     * high), so a still-high line is dropped and raised again a tick
+     * later.  Otherwise the line is held until the guest consumed the
+     * reply (ch1.read_index catches up). */
     if (events) {
-        qemu_set_irq(s->irq, 1);
-        s->irq_asserted = TRUE;
         s->last_reply_wr = ch1_wr;
-    } else if (s->irq_asserted) {
-        if (ch1_rd >= s->last_reply_wr || ch0_state == 4 || ch0_state == 0) {
+        if (s->irq_asserted) {
             qemu_set_irq(s->irq, 0);
             s->irq_asserted = FALSE;
+            s->reassert_ticks = SMD_GHOST_REASSERT_TICKS;
+        } else {
+            qemu_set_irq(s->irq, 1);
+            s->irq_asserted = TRUE;
+        }
+    } else if (s->irq_asserted && !s->reassert_ticks) {
+        if (ch1_rd >= s->last_reply_wr) {
+            qemu_set_irq(s->irq, 0);
+            s->irq_asserted = FALSE;
+        }
+    }
+
+    if (s->reassert_ticks) {
+        s->reassert_ticks--;
+        if (s->reassert_ticks == 0 && !s->irq_asserted) {
+            qemu_set_irq(s->irq, 1);
+            s->irq_asserted = TRUE;
         }
     }
 
