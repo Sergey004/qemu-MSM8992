@@ -65,17 +65,34 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MpmState, MSM8992_MPM)
 #define MPM_PS_HOLD                  0xA000   /* 0xFC4AB000 relative */
 #define MPM_KRAIT_SLEEP_US_DISABLE   0x2210
 
+/*
+ * Branch-vote registers at the end of the clock-controller window
+ * (0xFC4AA000/0xFC4AA00C/0xFC4AA010).  The TrustZone firmware claims a
+ * branch by writing its vote (with the INV bit) and then waits until the
+ * register reads back as all-ones, i.e. the hardware has taken the vote
+ * and released the branch.  Without them the TZ spins forever at the
+ * start of its bring-up code.
+ */
+#define MPM_VOTE_COUNT 3
+
 #define MSM8992_MPM_SIZE  0x010000            /* through PS_HOLD window */
+
+static const uint32_t mpm_vote_regs[MPM_VOTE_COUNT] = {
+    0x9000, 0x900C, 0x9010,
+};
 
 typedef struct Msm8992MpmState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     qemu_irq vcto;      /* VCTO interrupt (not wired in stage 1) */
     QEMUTimer *tick_timer; /* placeholder, unused for counting */
+    uint8_t vote_taken[MPM_VOTE_COUNT];
 } Msm8992MpmState;
 
 static uint64_t msm8992_mpm_read(void *opaque, hwaddr offset, unsigned size)
 {
+    Msm8992MpmState *s = MSM8992_MPM(opaque);
+
     switch (offset) {
     case MPM_SLEEP_TIMETICK_COUNT_VAL: /* 32.768 kHz sleep counter */
         return (uint32_t)((qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000)
@@ -85,6 +102,12 @@ static uint64_t msm8992_mpm_read(void *opaque, hwaddr offset, unsigned size)
     case MPM_PS_HOLD:
         return 0;
     default:
+        for (int i = 0; i < MPM_VOTE_COUNT; i++) {
+            if (offset == mpm_vote_regs[i]) {
+                /* released branch: all bits read back as ones */
+                return s->vote_taken[i] ? 0xFFFFFFFFu : 0;
+            }
+        }
         return 0;
     }
 }
@@ -92,6 +115,8 @@ static uint64_t msm8992_mpm_read(void *opaque, hwaddr offset, unsigned size)
 static void msm8992_mpm_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
+    Msm8992MpmState *s = MSM8992_MPM(opaque);
+
     switch (offset) {
     case MPM_PS_HOLD:
         qemu_log("msm8992-mpm: PS_HOLD request val=0x%" PRIx64
@@ -99,6 +124,15 @@ static void msm8992_mpm_write(void *opaque, hwaddr offset, uint64_t value,
         msm8992_mpm_forensic_dump();
         break;
     default:
+        for (int i = 0; i < MPM_VOTE_COUNT; i++) {
+            if (offset == mpm_vote_regs[i]) {
+                s->vote_taken[i] = 1;
+                qemu_log_mask(LOG_UNIMP,
+                              "msm8992-mpm: branch vote 0x%" PRIx64
+                              " -> released\n", value);
+                break;
+            }
+        }
         break;
     }
 }

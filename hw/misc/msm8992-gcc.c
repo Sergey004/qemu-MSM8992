@@ -55,6 +55,20 @@ static const struct {
     { 0x1190, 0x00000001 },   /* branch enable request, bit 0 */
 };
 
+/*
+ * Bring-up status registers.  The TrustZone firmware polls 0x0D00 until
+ * bit0 is set (and 0x0D04 until it turns negative) before it continues
+ * the boot; on real hardware the RPM reports "up" there.  The RPM itself
+ * is not modelled, so the flag is simply reported as set.
+ */
+static const struct {
+    uint32_t off;
+    uint32_t value;
+} msm8992_gcc_status_regs[] = {
+    { 0x0D00, 0x00000001 },
+    { 0x0D04, 0x00000000 },
+};
+
 static bool msm8992_gcc_is_ctrl_block(uint32_t off)
 {
     for (size_t i = 0; i < ARRAY_SIZE(msm8992_gcc_ctrl_blocks); i++) {
@@ -88,6 +102,11 @@ static uint64_t msm8992_gcc_read(void *opaque, hwaddr offset, unsigned size)
         size_t word = offset >> 2;
 
         v = s->regs[word];
+        for (size_t i = 0; i < ARRAY_SIZE(msm8992_gcc_status_regs); i++) {
+            if (offset == msm8992_gcc_status_regs[i].off) {
+                return msm8992_gcc_status_regs[i].value;
+            }
+        }
         /*
          * Clock-control blocks: report the hardware status the stock
          * ClockLib polls - "locked" (bit30) set, "busy" (bit31) clear.
