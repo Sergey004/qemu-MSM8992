@@ -8,8 +8,10 @@
  */
 
 #include "qemu/osdep.h"
+#include <stdarg.h>
 #include "system/blockdev.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/cpu.h"
 #include "migration/vmstate.h"
 #include "hw/core/irq.h"
 #include "hw/sd/sd.h"
@@ -21,6 +23,16 @@
 #include "qom/object.h"
 
 #define PL181_FIFO_LEN 16
+
+/*
+ * Bounded tracing.  The retail SBL1 drives this block hard (a single data
+ * transfer writes thousands of FIFO words), and the original per-event
+ * logging produced multi-GB traces.  Accesses are logged only until the
+ * budget below is used up, and the "unexpected access" warnings are
+ * reported a handful of times instead of once per event.
+ */
+#define PL181_TRACE_MAX   65536
+#define PL181_WARN_MAX    8
 
 #define TYPE_PL181 "pl181"
 OBJECT_DECLARE_SIMPLE_TYPE(PL181State, PL181)
@@ -57,6 +69,10 @@ struct PL181State {
     /* GPIO outputs for 'card is readonly' and 'card inserted' */
     qemu_irq card_readonly;
     qemu_irq card_inserted;
+    /* bounded tracing state */
+    uint32_t trace_count;
+    uint32_t warn_count;
+    uint32_t last_status;
 };
 
 static const VMStateDescription vmstate_pl181 = {
@@ -138,6 +154,40 @@ static void pl181_update(PL181State *s)
     for (i = 0; i < 2; i++) {
         qemu_set_irq(s->irq[i], (s->status & s->mask[i]) != 0);
     }
+}
+
+/*
+ * Register access trace.  Only the first PL181_TRACE_MAX accesses are
+ * reported: the retail SBL1 issues thousands of FIFO writes per transfer
+ * and an unbounded trace fills the disk.
+ */
+static void pl181_trace(PL181State *s, const char *dir, hwaddr offset,
+                        uint64_t value)
+{
+    if (s->trace_count >= PL181_TRACE_MAX) {
+        return;
+    }
+    s->trace_count++;
+    qemu_log_mask(LOG_GUEST_ERROR, "pl181: %s 0x%02x = 0x%08llx (status 0x%08x)\n",
+                  dir, (unsigned)offset, (unsigned long long)value, s->status);
+}
+
+/* Same idea for the "should not happen" paths. */
+static void pl181_warn(PL181State *s, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
+
+static void pl181_warn(PL181State *s, const char *fmt, ...)
+{
+    va_list ap;
+    char buf[256];
+
+    if (s->warn_count >= PL181_WARN_MAX) {
+        return;
+    }
+    s->warn_count++;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    qemu_log_mask(LOG_GUEST_ERROR, "%s", buf);
 }
 
 static void pl181_fifo_push(PL181State *s, uint32_t value)
@@ -287,14 +337,23 @@ static void pl181_fifo_run(PL181State *s)
     }
 }
 
-static uint64_t pl181_read(void *opaque, hwaddr offset,
-                           unsigned size)
+static uint64_t pl181_read_inner(void *opaque, hwaddr offset,
+                                  unsigned size)
 {
     PL181State *s = (PL181State *)opaque;
     uint32_t tmp;
 
     if (offset >= 0xfe0 && offset < 0x1000) {
         return pl181_id[(offset - 0xfe0) >> 2];
+    }
+    if (offset >= 0x40 && offset < 0x80) {
+        /* Vendor registers of the Qualcomm SDCC "core" block.  The retail
+         * SBL1 polls 0x6C before every command; log the caller so the
+         * register can be identified. */
+        CPUState *cs = current_cpu;
+        vaddr pc = cs && cs->cc->get_pc ? cs->cc->get_pc(cs) : 0;
+        pl181_warn(s, "pl181: read vendor reg 0x%02x from pc 0x%llx\n",
+                   (unsigned)offset, (unsigned long long)pc);
     }
     switch (offset) {
     case 0x00: /* Power */
@@ -335,6 +394,8 @@ static uint64_t pl181_read(void *opaque, hwaddr offset,
         return s->mask[0];
     case 0x40: /* Mask1 */
         return s->mask[1];
+    case 0x6c: /* SDCC core "busy" flag (Qualcomm) - idle here */
+        return 0;
     case 0x48: /* FifoCnt */
         /* The documentation is somewhat vague about exactly what FifoCnt
            does.  On real hardware it appears to be when decrememnted
@@ -354,7 +415,7 @@ static uint64_t pl181_read(void *opaque, hwaddr offset,
     case 0xa0: case 0xa4: case 0xa8: case 0xac:
     case 0xb0: case 0xb4: case 0xb8: case 0xbc:
         if (s->fifo_len == 0) {
-            qemu_log_mask(LOG_GUEST_ERROR, "pl181: Unexpected FIFO read\n");
+            pl181_warn(s, "pl181: Unexpected FIFO read\n");
             return 0;
         } else {
             uint32_t value;
@@ -365,10 +426,27 @@ static uint64_t pl181_read(void *opaque, hwaddr offset,
             return value;
         }
     default:
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "pl181_read: Bad offset %x\n", (int)offset);
+        pl181_warn(s, "pl181_read: Bad offset %x\n", (int)offset);
         return 0;
     }
+}
+
+static uint64_t pl181_read(void *opaque, hwaddr offset, unsigned size)
+{
+    PL181State *s = (PL181State *)opaque;
+    uint64_t value = pl181_read_inner(opaque, offset, size);
+
+    /* The guest polls the status register in a tight loop; log it only
+     * when it changes, so the trace stays readable. */
+    if (offset == 0x34) {
+        if (value != s->last_status) {
+            s->last_status = value;
+            pl181_trace(s, "read ", offset, value);
+        }
+    } else {
+        pl181_trace(s, "read ", offset, value);
+    }
+    return value;
 }
 
 static void pl181_write(void *opaque, hwaddr offset,
@@ -376,6 +454,7 @@ static void pl181_write(void *opaque, hwaddr offset,
 {
     PL181State *s = (PL181State *)opaque;
 
+    pl181_trace(s, "write", offset, value);
     switch (offset) {
     case 0x00: /* Power */
         s->power = value & 0xff;
@@ -407,7 +486,9 @@ static void pl181_write(void *opaque, hwaddr offset,
         s->datatimer = value;
         break;
     case 0x28: /* DataLength */
-        s->datalength = value & 0xffff;
+        /* The retail SBL1 transfers 0x10000 bytes in one go; the PL180's
+         * 13-bit field is too narrow for the Qualcomm SDCC core. */
+        s->datalength = value & 0xfffff;
         break;
     case 0x2c: /* DataCtrl */
         s->datactrl = value & 0xff;
@@ -430,15 +511,14 @@ static void pl181_write(void *opaque, hwaddr offset,
     case 0xa0: case 0xa4: case 0xa8: case 0xac:
     case 0xb0: case 0xb4: case 0xb8: case 0xbc:
         if (s->datacnt == 0) {
-            qemu_log_mask(LOG_GUEST_ERROR, "pl181: Unexpected FIFO write\n");
+            pl181_warn(s, "pl181: Unexpected FIFO write (datacnt 0)\n");
         } else {
             pl181_fifo_push(s, value);
             pl181_fifo_run(s);
         }
         break;
     default:
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "pl181_write: Bad offset %x\n", (int)offset);
+        pl181_warn(s, "pl181_write: Bad offset %x\n", (int)offset);
     }
     pl181_update(s);
 }
