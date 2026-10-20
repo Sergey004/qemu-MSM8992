@@ -272,6 +272,332 @@ static const MemoryRegionOps msm8992_rpm_clk_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+
+/*
+ * DDR PHY training (msm8992 "DRE" window 0xFC4E0000, second channel at
+ * 0xFC4E3800) and the RPM register-write channel at 0xFC4FF000.
+ *
+ * The stock SBL1 runs the LPDDR3 training in two phases, each of which
+ * asks the RPM (aoss) to do the work and then polls status registers:
+ *
+ *  - phase 1 (FUN_fec27658): command id 0x3C << k in 0xFC4FF008, then
+ *    wait for bit 12 of the AND of six status words (base + 0xC8, 0x8C8,
+ *    0x10C8, 0x18C8, 0x20C8, 0x28C8).
+ *  - phase 2 (FUN_fec46860): command id 0x3F << k, then the RPM request
+ *    pair (doorbell 0xFC4FFBD4 = 0xA00005, 0xA0000D), then wait for bit 1
+ *    of the OR of the same six words to be 0 (the RPM cleared the old
+ *    result), a second request (0xA00005 alone), then wait for bit 1 of
+ *    their AND to be 1 (the new result).
+ *
+ * Without an RPM image we play the RPM: the doorbell writes drive the
+ * result state of the status words.
+ */
+#define MSM8992_DDR_PHY_BASE   0xFC4E0000ULL
+#define MSM8992_DDR_PHY_SIZE   0x8000ULL
+#define MSM8992_DRE_LANE_SIZE  0x800ULL
+#define MSM8992_DRE_LANES      (MSM8992_DDR_PHY_SIZE / MSM8992_DRE_LANE_SIZE)
+#define MSM8992_RPM_REGWRITE   0xFC4FF000ULL
+#define MSM8992_RPM_REGWRITE_SIZE 0x2000ULL
+
+typedef struct Msm8992DdrState {
+    /*
+     * The DRE (DDR PHY) is lane-structured: 16 lanes of 0x800 bytes each
+     * inside the 0xFC4E0000 window.  Channel 0 owns the lanes below
+     * 0xFC4E3800, channel 1 the ones above.
+     */
+    uint32_t lane[MSM8992_DRE_LANES][MSM8992_DRE_LANE_SIZE / 4];
+    /* phase-2 result state per channel (bit 1 of the lane +0x3DC words) */
+    uint8_t phase2_ready[2];
+    /* a 0x..0D doorbell was seen, so the next 0x..05 doorbell publishes */
+    uint8_t armed[2];
+    /* channel the last command id selected */
+    uint32_t channel;
+    /* the RPM register-write channel's doorbell */
+    uint32_t doorbell;
+} Msm8992DdrState;
+
+/*
+ * Channel 1's DRE window starts at 0xFC4E3800 (lane 7); channel 0 uses
+ * the lanes below it.
+ */
+#define MSM8992_DRE_CH1_BASE 0x3800ULL
+
+static uint32_t msm8992_dre_channel(hwaddr offset)
+{
+    return offset >= MSM8992_DRE_CH1_BASE ? 1 : 0;
+}
+
+static uint64_t msm8992_ddr_phy_read(void *opaque, hwaddr offset, unsigned size)
+{
+    Msm8992DdrState *st = opaque;
+    uint32_t lane = offset / MSM8992_DRE_LANE_SIZE;
+    uint32_t lo = offset % MSM8992_DRE_LANE_SIZE;
+    uint32_t v = st->lane[lane][lo >> 2];
+
+    switch (lo) {
+    case 0x0C8:
+        /* phase 1: the training is done */
+        v |= 0x1000u;
+        break;
+    case 0x3DC:
+        /* phase 2: the training result is available */
+        v |= st->phase2_ready[msm8992_dre_channel(offset)] ? 0x2u : 0u;
+        break;
+    default:
+        break;
+    }
+    return v;
+}
+
+static void msm8992_ddr_phy_write(void *opaque, hwaddr offset, uint64_t value,
+                                  unsigned size)
+{
+    Msm8992DdrState *st = opaque;
+    uint32_t lane = offset / MSM8992_DRE_LANE_SIZE;
+    uint32_t lo = offset % MSM8992_DRE_LANE_SIZE;
+
+    st->lane[lane][lo >> 2] = value;
+    if (lo == 0x260) {
+        /*
+         * The lane control register starts the DRE training engines.
+         * Bit 0 asks for the first training (read levelling), bit 29 for
+         * the second one (write levelling); the lane reports the result
+         * in the status register at +0x278 and the value itself at
+         * +0x288.
+         */
+        if (value & 0x1u) {
+            st->lane[lane][0x278 >> 2] |= 0x1u;
+        }
+        if (value & 0x20000000u) {
+            st->lane[lane][0x278 >> 2] |= 0x2u;
+        }
+    }
+}
+
+static const MemoryRegionOps msm8992_ddr_phy_ops = {
+    .read = msm8992_ddr_phy_read,
+    .write = msm8992_ddr_phy_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/*
+ * The RPM register-write channel: +0x8 carries the command id, +0x3D4 is
+ * the doorbell.  A doorbell write of 0xA00005 starts one half of an RPM
+ * request; the second one publishes the result.
+ */
+static uint64_t msm8992_rpm_regwrite_read(void *opaque, hwaddr offset,
+                                          unsigned size)
+{
+    return 0;
+}
+
+static void msm8992_rpm_regwrite_write(void *opaque, hwaddr offset,
+                                       uint64_t value, unsigned size)
+{
+    Msm8992DdrState *st = opaque;
+
+    switch (offset) {
+    case 0x08:
+        /*
+         * Command id.  The DRE training commands are 0x3C (phase 1) and
+         * 0x3F (phase 2), each shifted left by 7 bits per channel.
+         */
+        if (value == 0x3cu || value == 0x3fu) {
+            st->channel = 0;
+        } else if (value == 0x1E3Cu || value == 0x1F80u) {
+            st->channel = 1;
+        }
+        st->doorbell = value;
+        break;
+    case 0xBD4:                 /* 0xFC4FF800 + 0x3D4: the doorbell */
+    {
+        uint32_t opcode = value & 0xFFu;
+        uint32_t ch = st->channel;
+
+        st->doorbell = value;
+        if (opcode == 0x0Du) {
+            /*
+             * The second half of a request: the DRE status words are
+             * cleared, the firmware waits for that (bit 1 of the OR of the
+             * six words must be 0).
+             */
+            st->phase2_ready[ch] = 0;
+            st->armed[ch] = 1;
+        } else if (opcode == 0x05u) {
+            /*
+             * The first half of a request clears the result, the request
+             * that follows the 0x0D half publishes it (the firmware then
+             * waits for bit 1 of the AND of the six words to be 1).
+             */
+            if (st->armed[ch]) {
+                st->phase2_ready[ch] = 1;
+                st->armed[ch] = 0;
+            } else {
+                st->phase2_ready[ch] = 0;
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/*
+ * NOC (interconnect) port blocks.
+ *
+ * The stock SBL1 drives the DDR channels' NOC ports through three
+ * register blocks per channel:
+ *
+ *   0xFC3B0000 / 0xFC3BC000  "arbiter" - port priority registers (+0x420,
+ *                                            +0x424) and the ICB config
+ *                                            registers the SBL1 applies
+ *                                            from the eMMC ICB table
+ *   0xFC3B4000 / 0xFC3C0000  port status - +0x8C: bits 20/21 report the
+ *                                            port ready, bits 24/25 the
+ *                                            port busy
+ *   0xFC3B5000 / 0xFC3C1000  the port itself - +0x20 is the update
+ *                                            register, +0x74 the port
+ *                                            state
+ *
+ * The update register +0x20 carries a set of "apply" bits: the firmware
+ * ORs one of them in, then polls the register until that bit falls again
+ * - the fabric has taken the update.  Our fabric applies every update
+ * immediately, so the apply bits are cleared on write.  The remaining
+ * bits of +0x20 are plain configuration and keep their value.
+ *
+ * Writing bit 15 into +0x20 enables the port, bit 13 disables it; +0x74
+ * bit 1 reports the resulting port state.
+ */
+#define MSM8992_NOC_SIZE 0x1000ULL
+
+/*
+ * The "apply" bits of the port update register (+0x20).  Each of them
+ * is ORed in by one of the SBL1's port helpers and polled until it
+ * falls again: bit 5 (port enable), 6, 11, 12, 13 (port disable), 15,
+ * 18, 20, 21, 23, 24, 26 and 27.
+ */
+#define MSM8992_NOC_APPLY_BITS \
+    (0x20u | 0x40u | 0x800u | 0x1000u | 0x2000u | 0x8000u | 0x40000u | \
+     0x100000u | 0x200000u | 0x800000u | 0x1000000u | 0x4000000u | \
+     0x8000000u)
+
+typedef struct Msm8992NocState {
+    uint32_t regs[MSM8992_NOC_SIZE / 4];
+    /* the NOC port is enabled */
+    uint8_t port_active;
+} Msm8992NocState;
+
+static uint64_t msm8992_noc_read(void *opaque, hwaddr offset, unsigned size)
+{
+    Msm8992NocState *st = opaque;
+    uint32_t v = st->regs[offset >> 2];
+
+    switch (offset) {
+    case 0x20:
+        /* the apply bits are cleared once the update was taken */
+        v &= ~MSM8992_NOC_APPLY_BITS;
+        break;
+    case 0x74:
+        /* bit 1: the NOC port is enabled */
+        v = (v & ~0x2u) | (st->port_active ? 0x2u : 0u);
+        break;
+    case 0x8C:
+        /* bits 20/21: the port is ready, bits 24/25: the port is busy */
+        v = (v & ~0x03000000u) | 0x00300000u;
+        break;
+    default:
+        break;
+    }
+    return v;
+}
+
+static void msm8992_noc_write(void *opaque, hwaddr offset, uint64_t value,
+                               unsigned size)
+{
+    Msm8992NocState *st = opaque;
+
+    if (offset == 0x20) {
+        st->regs[offset >> 2] = value & ~MSM8992_NOC_APPLY_BITS;
+        if (value & 0x2000u) {
+            st->port_active = 0;         /* disable the port */
+        } else if (value & 0x8000u) {
+            st->port_active = 1;         /* enable the port */
+        }
+        return;
+    }
+    st->regs[offset >> 2] = value;
+}
+
+static const MemoryRegionOps msm8992_noc_ops = {
+    .read = msm8992_noc_read,
+    .write = msm8992_noc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static const MemoryRegionOps msm8992_rpm_regwrite_ops = {
+    .read = msm8992_rpm_regwrite_read,
+    .write = msm8992_rpm_regwrite_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/*
+ * The peripheral space the SBL1's DDR bring-up walks is mostly unimplemented
+ * on our side.  Logging every access buries the log in tens of millions of
+ * lines (the training poll alone reads the same word thousands of times),
+ * so each 4 KiB page is reported only once.
+ */
+#define MSM8992_PERIPH_HOLE_BASE 0xEF000000ULL
+#define MSM8992_PERIPH_HOLE_SIZE 0x10000000ULL
+
+typedef struct Msm8992PeriphHoleState {
+    MemoryRegion iomem;
+    uint32_t *regs;
+    uint8_t *logged;            /* one flag per 4 KiB page */
+} Msm8992PeriphHoleState;
+
+static uint64_t msm8992_periph_hole_read(void *opaque, hwaddr offset,
+                                         unsigned size)
+{
+    Msm8992PeriphHoleState *st = opaque;
+    uint32_t v = st->regs[offset >> 2];
+
+    if (!st->logged[offset >> 12]) {
+        st->logged[offset >> 12] = 1;
+        qemu_log_mask(LOG_UNIMP, "periph-hole: read  0x%08" HWADDR_PRIx "\n",
+                      (hwaddr)(MSM8992_PERIPH_HOLE_BASE + offset));
+    }
+    return v;
+}
+
+static void msm8992_periph_hole_write(void *opaque, hwaddr offset,
+                                      uint64_t value, unsigned size)
+{
+    Msm8992PeriphHoleState *st = opaque;
+
+    st->regs[offset >> 2] = value;
+    if (!st->logged[offset >> 12]) {
+        st->logged[offset >> 12] = 1;
+        qemu_log_mask(LOG_UNIMP, "periph-hole: write 0x%08" HWADDR_PRIx
+                      " = 0x%08" PRIx64 "\n",
+                      (hwaddr)(MSM8992_PERIPH_HOLE_BASE + offset), value);
+    }
+}
+
+static const MemoryRegionOps msm8992_periph_hole_ops = {
+    .read = msm8992_periph_hole_read,
+    .write = msm8992_periph_hole_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static void msm8992_create_uart(Msm8992MachineState *s, qemu_irq *gic_spi)
 {
     /* DBG2 console: UARTDM (qcom,msm-lsuart-v14), minimal model in
@@ -400,6 +726,70 @@ static void msm8992_create_stubs(MachineState *ms)
      * every unimplemented access the stock firmware makes is exactly the
      * behavior contract the real models must implement.
      */
+    /*
+     * Benevolent peripheral space: the stock SBL1's DDR bring-up walks
+     * the BIMC/DRE/ICB registers and the RPM IPC blocks, most of which
+     * live in windows we do not model yet.  Without a mapping every
+     * such access is a data abort (302a) that kills the boot before it
+     * can tell us what it wanted.  Reserving the whole peripheral range
+     * as "unimplemented" turns those aborts into logged reads-as-zero,
+     * so the boot keeps going and the log tells us which registers
+     * the DDR contract actually needs.
+     */
+    {
+        Msm8992PeriphHoleState *st = g_new0(Msm8992PeriphHoleState, 1);
+
+        st->regs = g_new0(uint32_t, MSM8992_PERIPH_HOLE_SIZE / 4);
+        st->logged = g_new0(uint8_t, MSM8992_PERIPH_HOLE_SIZE / 4096);
+        memory_region_init_io(&st->iomem, NULL, &msm8992_periph_hole_ops, st,
+                              "msm8992.periph-hole",
+                              MSM8992_PERIPH_HOLE_SIZE);
+        /* priority -1000: the SBL1 work RAM (0xFEC00000) and the IMEM
+         * keep their priority-0 mappings inside this range */
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            MSM8992_PERIPH_HOLE_BASE,
+                                            &st->iomem, -1000);
+    }
+    {
+        MemoryRegion *r = g_new(MemoryRegion, 1);
+        Msm8992DdrState *st = g_new0(Msm8992DdrState, 1);
+
+        /* no training result is available yet */
+        st->phase2_ready[0] = 0;
+        st->phase2_ready[1] = 0;
+
+        memory_region_init_io(r, NULL, &msm8992_ddr_phy_ops, st,
+                              "msm8992.ddr-phy", MSM8992_DDR_PHY_SIZE);
+        memory_region_add_subregion(get_system_memory(), MSM8992_DDR_PHY_BASE, r);
+
+        /*
+         * The NOC port blocks of both DDR channels.  They overlap the
+         * unimplemented "bimc" window, so they need a higher priority.
+         */
+        {
+            static const hwaddr noc_base[] = {
+                0xFC3B0000ULL, 0xFC3B4000ULL, 0xFC3B5000ULL,
+                0xFC3BC000ULL, 0xFC3C0000ULL, 0xFC3C1000ULL
+            };
+
+            for (size_t i = 0; i < ARRAY_SIZE(noc_base); i++) {
+                Msm8992NocState *nst = g_new0(Msm8992NocState, 1);
+                MemoryRegion *nr = g_new(MemoryRegion, 1);
+
+                memory_region_init_io(nr, NULL, &msm8992_noc_ops, nst,
+                                      "msm8992.noc", MSM8992_NOC_SIZE);
+                memory_region_add_subregion_overlap(get_system_memory(),
+                                                    noc_base[i], nr, 10);
+            }
+        }
+
+        r = g_new(MemoryRegion, 1);
+        memory_region_init_io(r, NULL, &msm8992_rpm_regwrite_ops, st,
+                              "msm8992.rpm-regwrite",
+                              MSM8992_RPM_REGWRITE_SIZE);
+        memory_region_add_subregion(get_system_memory(), MSM8992_RPM_REGWRITE, r);
+    }
+
     {
         DeviceState *g;
         g = qdev_new("msm8992-gcc");
@@ -450,9 +840,17 @@ static void msm8992_create_stubs(MachineState *ms)
     }
     create_unimplemented_device("sec-trust-ctrl", 0xFC4B8000, 0x7000);
     create_unimplemented_device("rpm-msgram", MSM8992_RPM_MSGRAM, 0x4000);
-    /* SBL1 clears the RPM IPC status/ack words at +0x20/+0x24 of this
-     * block; without a mapping the write faults (data abort, 302a). */
+    /*
+     * RPM IPC blocks used by the stock SBL1:
+     *  - 0xFC44F000: the IPC status/ack words the SBL1 clears at
+     *    +0x20/+0x24 (FUN_fec30b7c).
+     *  - 0xFC4FF000: the register-write channel - the SBL1 drops the list
+     *    of registers it wants the RPM to program at +0x800 and the
+     *    command id at +0x8 (FUN_fec275a4).
+     * Both must be mapped or the writes fault (data abort, 302a).
+     */
     create_unimplemented_device("rpm-ipc", 0xFC44F000ULL, 0x1000);
+    /* 0xFC4FF000: the RPM register-write channel, modelled below */
     {
         /*
          * Qualcomm Cortex Timer (QCT-QTIMER, the model from the official
@@ -481,10 +879,12 @@ static void msm8992_create_stubs(MachineState *ms)
 
     /* Tier-2/3 placeholders */
     create_unimplemented_device("mmss-lo",   0xFD800000ULL, 0xC0000);
-    /* BIMC / DDR PHY window (msm8992 dtsi: bimc@fc380000): SBL1's DDR
-     * driver runs its LPDDR3 training against these registers. Reads-as-0
-     * for now; every access is logged for the DDR contract extraction. */
-    create_unimplemented_device("bimc",      0xFC380000ULL, 0x20000);
+    /* DDR / interconnect window: BIMC (msm8992 dtsi: bimc@fc380000) plus
+     * the DRE/DDR-PHY and ICB register blocks above it.  The stock SBL1
+     * programs these through the "icb_config_data" table it reads from
+     * /dev/icb/config_boot_do_0_rdwr_train, e.g. 0xFC3B1210 and
+     * 0xFC3C8240 - a hole here aborts the boot with a data abort. */
+    create_unimplemented_device("bimc",      0xFC000000ULL, 0x400000);
     create_unimplemented_device("vbif",      0xFD8C0000ULL, 0x40000);
     create_unimplemented_device("kgsl-3d0",  MSM8992_KGSL_BASE, 0x10000);
     create_unimplemented_device("mdp5",      MSM8992_MDP5_BASE, 0xB4000);
