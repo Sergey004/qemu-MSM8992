@@ -416,6 +416,9 @@ static void msm8992_create_stubs(MachineState *ms)
     }
     create_unimplemented_device("sec-trust-ctrl", 0xFC4B8000, 0x7000);
     create_unimplemented_device("rpm-msgram", MSM8992_RPM_MSGRAM, 0x4000);
+    /* SBL1 clears the RPM IPC status/ack words at +0x20/+0x24 of this
+     * block; without a mapping the write faults (data abort, 302a). */
+    create_unimplemented_device("rpm-ipc", 0xFC44F000ULL, 0x1000);
     {
         /*
          * Qualcomm Cortex Timer (QCT-QTIMER, the model from the official
