@@ -838,7 +838,15 @@ static void msm8992_create_stubs(MachineState *ms)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(pr), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(pr), 0, 0xF9BFF000ULL);
     }
-    create_unimplemented_device("sec-trust-ctrl", 0xFC4B8000, 0x7000);
+    /*
+     * 0xFC4B8000: the "secure peripheral" window the TrustZone firmware
+     * programs when it protects peripherals with the XPU2 firewall.
+     */
+    {
+        DeviceState *xpu2 = qdev_new("msm8992-xpu2");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(xpu2), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(xpu2), 0, 0xFC4B8000ULL);
+    }
     create_unimplemented_device("rpm-msgram", MSM8992_RPM_MSGRAM, 0x4000);
     /*
      * RPM IPC blocks used by the stock SBL1:

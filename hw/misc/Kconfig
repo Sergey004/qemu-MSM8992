@@ -192,6 +192,9 @@ config MSM8992_PRNG
 config MSM8992_GCC
     bool
 
+config MSM8992_XPU2
+    bool
+
 config MSM8992_TCSR
     bool
 

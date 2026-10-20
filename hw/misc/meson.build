@@ -183,6 +183,7 @@ system_ss.add(when: 'CONFIG_MSM8992_APCS', if_true: files('msm8992-apcs.c'))
 system_ss.add(when: 'CONFIG_MSM8992_SMDGHOST', if_true: files('msm8992-smdghost.c'))
 
 system_ss.add(when: 'CONFIG_MSM8992_GCC', if_true: files('msm8992-gcc.c'))
+system_ss.add(when: 'CONFIG_MSM8992_XPU2', if_true: files('msm8992-xpu2.c'))
 system_ss.add(when: 'CONFIG_MSM8992_TCSR', if_true: files('msm8992-tcsr.c'))
 
 system_ss.add(when: 'CONFIG_MSM8992_SPMI', if_true: files('msm8992-spmi.c'))
