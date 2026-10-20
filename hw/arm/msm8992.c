@@ -43,6 +43,11 @@
 #include "hw/intc/arm_gic.h"
 #include "hw/misc/unimp.h"
 #include "system/system.h"
+#include "system/block-backend-global-state.h"
+#include "system/blockdev.h"
+#include "qobject/qdict.h"
+#include "qemu/option.h"
+#include "block/block-common.h"
 #include "hw/sd/sdhci.h"
 #include "hw/timer/qct-qtimer.h"
 #include "target/arm/cpu-qom.h"
@@ -92,6 +97,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MachineState, MSM8992_MACHINE)
 
 #define MSM8992_UART2_IRQ   108                 /* DT SPI */
 #define MSM8992_SDC1_IRQ    123                 /* DT SPI 123 == ACPI GSIV 155 */
+#define MSM8992_SDC1_SDHCI_IRQ 138             /* SDCC1_PWRCTL_IRQ, INTID 170 */
 #define MSM8992_SDC2_IRQ    125                 /* per bullhead DT sdhc_2 */
 
 /* GIC PPI interrupt numbers (banked per-CPU) */
@@ -614,25 +620,43 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
 {
     SysBusDevice *sbd;
     DeviceState *sdc1_host;
+    DeviceState *sdc1_sdhci = NULL;
 
     /* eMMC boot device; attach the pre-flashed GPT image via -drive if=sd.
      * Two register banks on the same controller: legacy MCI (PL181-like)
      * @0xF9824000 (retail SBL1's path) and SDHCI @0xF9824900 (UEFI's path).
-     * Only one host is instantiated per lane since they share the card. */
+     * The two banks share the card, so both hosts need one. */
     if (fullchain) {
         sdc1_host = qdev_new("pl181");
         sbd = SYS_BUS_DEVICE(sdc1_host);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, MSM8992_SDC1_CONF);
         sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
+
+        /*
+         * The retail SBL1 drives the legacy MCI bank, the UEFI's MMCHS
+         * driver drives the SDHCI bank of the same controller and expects
+         * its interrupt on SDCC1_PWRCTL_IRQ (INTID 170).  The SDHCI window
+         * overlaps the tail of the MCI window (0x900..0xfff), which the MCI
+         * model does not implement, so the two can live side by side.
+         */
+        sdc1_sdhci = qdev_new(TYPE_SYSBUS_SDHCI);
+        sbd = SYS_BUS_DEVICE(sdc1_sdhci);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, MSM8992_SDC1_BASE);
+        sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_SDHCI_IRQ]);
+        /* QC's SDHCI vendor registers (clock/DLL/power) past the generic set */
+        create_unimplemented_device("sdc1-sdhci-vendor",
+                                    MSM8992_SDC1_BASE + 0x100, 0x200);
     } else {
         sdc1_host = s->sdc1 = qdev_new(TYPE_SYSBUS_SDHCI);
         sbd = SYS_BUS_DEVICE(sdc1_host);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, MSM8992_SDC1_BASE);
-        sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
+        sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_SDHCI_IRQ]);
         /* QC's SDHCI vendor registers extend past the generic 0x100 window */
-        create_unimplemented_device("sdc1-pad", MSM8992_SDC1_BASE, 0x1000);
+        create_unimplemented_device("sdc1-pad", MSM8992_SDC1_BASE + 0x100,
+                                    0x200);
         create_unimplemented_device("sdhc1-vendor-cfg", MSM8992_SDC1_CONF,
                                     0x800);
     }
@@ -651,6 +675,38 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
                               BUS(qdev_get_child_bus(sdc1_host, "sd-bus")),
                               &error_fatal))
                 g_assert_not_reached();
+
+            /* The second host (UEFI's SDHCI) needs to see the same eMMC, but
+             * a legacy drive can only be attached to one device.  Give it a
+             * read-only view of the very same image - the retail SBL1 has
+             * already finished with the card by the time the UEFI runs, and
+             * the UEFI only reads the partition table. */
+            const char *path = qemu_opt_get(dinfo->opts, "file");
+
+            if (sdc1_sdhci && path) {
+                BlockBackend *be;
+                DeviceState *card2;
+                QDict *opts = qdict_new();
+
+                qdict_put_str(opts, "driver", "raw");
+                /*
+                 * BDRV_O_SNAPSHOT: the image itself is opened read-only and
+                 * the writes go to a temporary file, exactly like the
+                 * snapshot=on of the first (legacy) drive.
+                 * blk_new_open() takes ownership of the options dict.
+                 */
+                be = blk_new_open(path, NULL, opts,
+                                   BDRV_O_RDWR | BDRV_O_SNAPSHOT,
+                                   &error_fatal);
+
+                card2 = qdev_new(TYPE_EMMC);
+                qdev_prop_set_drive_err(card2, "drive", be, &error_fatal);
+                if (!qdev_realize(DEVICE(card2),
+                                  BUS(qdev_get_child_bus(sdc1_sdhci,
+                                                         "sd-bus")),
+                                  &error_fatal))
+                    g_assert_not_reached();
+            }
         }
     }
 
