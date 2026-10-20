@@ -17,12 +17,16 @@
 
 OBJECT_DECLARE_SIMPLE_TYPE(UnimplementedDeviceState, UNIMPLEMENTED_DEVICE)
 
+#define UNIMP_LOG_MAX_PAGES 4096
+
 struct UnimplementedDeviceState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     unsigned offset_fmt_width;
     char *name;
     uint64_t size;
+    /* one flag per 4 KiB page: already logged */
+    uint8_t logged[UNIMP_LOG_MAX_PAGES];
 };
 
 /**

@@ -18,13 +18,35 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 
+/*
+ * Log each 4 KiB page at most once.  The stock firmware polls some
+ * registers thousands of times per second; logging every access
+ * produced multi-gigabyte logs without adding any information about
+ * which registers the firmware actually touches.
+ */
+static bool unimp_page_logged(UnimplementedDeviceState *s, hwaddr offset)
+{
+    hwaddr page = offset >> 12;
+
+    if (page >= UNIMP_LOG_MAX_PAGES) {
+        return true;
+    }
+    if (s->logged[page]) {
+        return false;
+    }
+    s->logged[page] = 1;
+    return true;
+}
+
 static uint64_t unimp_read(void *opaque, hwaddr offset, unsigned size)
 {
     UnimplementedDeviceState *s = UNIMPLEMENTED_DEVICE(opaque);
 
-    qemu_log_mask(LOG_UNIMP, "%s: unimplemented device read  "
-                  "(size %d, offset 0x%0*" HWADDR_PRIx ")\n",
-                  s->name, size, s->offset_fmt_width, offset);
+    if (unimp_page_logged(s, offset)) {
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented device read  "
+                      "(size %d, offset 0x%0*" HWADDR_PRIx ")\n",
+                      s->name, size, s->offset_fmt_width, offset);
+    }
     return 0;
 }
 
@@ -33,10 +55,13 @@ static void unimp_write(void *opaque, hwaddr offset,
 {
     UnimplementedDeviceState *s = UNIMPLEMENTED_DEVICE(opaque);
 
-    qemu_log_mask(LOG_UNIMP, "%s: unimplemented device write "
-                  "(size %d, offset 0x%0*" HWADDR_PRIx
-                  ", value 0x%0*" PRIx64 ")\n",
-                  s->name, size, s->offset_fmt_width, offset, size << 1, value);
+    if (unimp_page_logged(s, offset)) {
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented device write "
+                      "(size %d, offset 0x%0*" HWADDR_PRIx
+                      ", value 0x%0*" PRIx64 ")\n",
+                      s->name, size, s->offset_fmt_width, offset, size << 1,
+                      value);
+    }
 }
 
 static const MemoryRegionOps unimp_ops = {
