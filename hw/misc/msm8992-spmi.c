@@ -62,6 +62,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992SpmiState, MSM8992_SPMI)
 #define PMIC_TYPE_QC       0x51
 #define PMIC_MODEL_PM8994  0x09   /* retail SBL1 table: 9 -> /boot/pm8994 */
 #define PMIC_REG_PON_DIGM  0x801   /* DIG_MAJOR checked for 0 (warm boot) */
+/* PON interrupt status: bit 0 = power key pressed, bit 1 = resin
+ * (the volume keys).  The firmware polls this register through the
+ * PM8x41 driver to notice the side keys. */
+#define PMIC_REG_PON_INT_RT_STS 0x810
+/*
+ * The power key of the phone is the GPIO 3 of the PMIC: the firmware
+ * polls the status register of that GPIO peripheral (0xC000 + (3-1)*0x100
+ * + 0x08) and takes bit 0 as "pressed".
+ */
+#define PMIC_REG_GPIO3_STATUS 0xC208
+#define PMIC_PON_INT_KPDPWR   0x01
+#define PMIC_PON_INT_RESIN    0x02
 #define PMIC_REG_PON_TYPE  0x804   /* PERPH_TYPE: PM_HW_MODULE_PON = 1 */
 #define PMIC_REG_PON_SUB   0x805
 #define PMIC_REG_PBS_TYPE  0x7004  /* PERPH_TYPE: PM_HW_MODULE_PBS = 0x16 */
@@ -84,6 +96,7 @@ typedef struct Msm8992SpmiState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     uint32_t regs[SPMI_SIZE / 4];
+    bool pwrkey_pressed;   /* the power key is held down */
     bool tran_done[SPMI_NUM_CH];
     uint32_t rdata[SPMI_NUM_CH][2];
     uint32_t wdata[SPMI_NUM_CH][2];
@@ -215,6 +228,11 @@ static uint8_t msm8992_pmic_read_byte(Msm8992SpmiState *s, unsigned sid,
     case PMIC_REG_ANA_MINOR: return 0x01;   /* metal revision */
     case PMIC_REG_ANA_MAJOR: return 0x02;   /* all-layer revision */
     case PMIC_REG_PON_DIGM:  return 0x00;
+    case PMIC_REG_PON_INT_RT_STS:
+        return s->pwrkey_pressed ? PMIC_PON_INT_KPDPWR : 0x00;
+    case PMIC_REG_GPIO3_STATUS:
+        /* the power key, read through the PMIC's GPIO 3 */
+        return s->pwrkey_pressed ? 0x01 : 0x00;
     case PMIC_REG_CHG_STAT1: return 0x01;   /* "ready" bit polled by the driver */
     case PMIC_REG_CHG_STAT2: return 0x01;
     case PMIC_REG_CHG_STAT3: return 0x09;
@@ -326,6 +344,37 @@ static const MemoryRegionOps msm8992_spmi_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+static bool msm8992_spmi_get_pwrkey(Object *obj, Error **errp)
+{
+    return MSM8992_SPMI(obj)->pwrkey_pressed;
+}
+
+static void msm8992_spmi_set_pwrkey(Object *obj, bool value, Error **errp)
+{
+    Msm8992SpmiState *s = MSM8992_SPMI(obj);
+
+    if (s->pwrkey_pressed != value) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "msm8992-spmi: power key %s\n",
+                      value ? "pressed" : "released");
+    }
+    s->pwrkey_pressed = value;
+}
+
+static void msm8992_spmi_instance_init(Object *obj)
+{
+    /*
+     * The side keys of the phone hang off the PMIC: the firmware polls
+     * PON_INT_RT_STS to notice the power key.  The property makes it
+     * possible to press it from the outside:
+     *
+     *   qom-set /machine/pmic power-key-pressed true
+     */
+    object_property_add_bool(obj, "power-key-pressed",
+                              msm8992_spmi_get_pwrkey,
+                              msm8992_spmi_set_pwrkey);
+}
+
 static void msm8992_spmi_realize(DeviceState *dev, Error **errp)
 {
     Msm8992SpmiState *s = MSM8992_SPMI(dev);
@@ -346,6 +395,7 @@ static const TypeInfo msm8992_spmi_info = {
     .name          = TYPE_MSM8992_SPMI,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Msm8992SpmiState),
+    .instance_init = msm8992_spmi_instance_init,
     .class_init    = msm8992_spmi_class_init,
 };
 

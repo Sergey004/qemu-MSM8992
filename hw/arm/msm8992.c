@@ -842,7 +842,7 @@ static void msm8992_low_scratch_write(void *opaque, hwaddr addr, uint64_t val,
                   size, (unsigned long long)addr, (unsigned long long)val);
 }
 
-static void msm8992_create_stubs(MachineState *ms)
+static void msm8992_create_stubs(MachineState *ms, qemu_irq *gic_spi)
 {
     /* MPM2: sleep-wake timer + PS_HOLD (stock firmware polls it for delays) */
     DeviceState *mpm = qdev_new("msm8992-mpm");
@@ -992,6 +992,9 @@ static void msm8992_create_stubs(MachineState *ms)
     {
         DeviceState *sp;
         sp = qdev_new("msm8992-spmi");
+        /* a stable QOM path so the power key can be pressed from the
+         * outside: qom-set /machine/pmic power-key-pressed true */
+        object_property_add_child(OBJECT(ms), "pmic", OBJECT(sp));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sp), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sp), 0, MSM8992_SPMI_BASE);
     }
@@ -1041,6 +1044,13 @@ static void msm8992_create_stubs(MachineState *ms)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(qt), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(qt), 0, MSM8992_QTIMER_F0 - 0x1000);
         sysbus_mmio_map(SYS_BUS_DEVICE(qt), 1, MSM8992_QTIMER_F0);
+        /*
+         * The QCOM timer raises GIC SPI 9 (INTID 41) - that is the vector
+         * the firmware's TimerDxe enables.  Without it the DXE timer never
+         * ticks: the keypad is polled by a timer, so no side key is ever
+         * seen, and the boot splash waits for it forever.
+         */
+        sysbus_connect_irq(SYS_BUS_DEVICE(qt), 0, gic_spi[9]);
     }
     {
         DeviceState *fb;
@@ -1718,7 +1728,7 @@ static void msm8992_init(MachineState *machine)
     msm8992_create_uart(s, gic_spi);
     msm8992_create_sdc1(s, gic_spi, s->fullchain);
 
-    msm8992_create_stubs(machine);
+    msm8992_create_stubs(machine, gic_spi);
 
     /* SMD ghost coprocessor: emulates the RPM side of the rpm_requests
      * channel on SMEM; raises GIC INTID 200 (PcdSmdIrq used by SmdDxe). */
