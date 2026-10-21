@@ -17,13 +17,39 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992GccState, MSM8992_GCC)
 #define MSM8992_GCC_SIZE 0x2000
 #define GCC_REGS_WORDS (MSM8992_GCC_SIZE / 4)
 
+/* Defaults: Snapdragon 808 - A53 core 0 at 1.5 GHz, LPDDR3-1866 (933 MHz) */
+#define MSM8992_GCC_PROP_CPU0_FREQ_KHZ  1500000
+#define MSM8992_GCC_PROP_DDR_FREQ_KHZ    933000
+
 typedef struct Msm8992GccState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     uint32_t regs[GCC_REGS_WORDS];
     uint64_t hot_bm[GCC_REGS_WORDS / 64 + 1];
     uint64_t upd_bm[GCC_REGS_WORDS / 64 + 1]; /* last write had bit0=1 */
+    uint16_t read_cnt[GCC_REGS_WORDS];       /* for the repeated-read trace */
+    uint32_t core0_freq_khz;                /* rate of CPU core 0 */
+    uint32_t ddr_freq_khz;                  /* DRAM clock rate */
 } Msm8992GccState;
+
+/*
+ * Rate registers.  The clock controller is the block that knows how fast the
+ * clocks it produces actually run, so the two rates the firmware asks about
+ * live here:
+ *
+ *   +0x1F00  CORE0_FREQ_KHZ  rate of CPU core 0 in kHz (read-only)
+ *   +0x1F04  DDR_FREQ_KHZ    DRAM clock rate in kHz (read-only)
+ *
+ * Snapdragon 808 (MSM8992) values, as used by the retail firmware:
+ *   - core 0 is a Cortex-A53 (cpu0..3 are A53, cpu4..5 are A57); the A53
+ *     cluster runs at up to 1.5 GHz;
+ *   - the DRAM is LPDDR3-1866, i.e. a 933 MHz clock.
+ *
+ * On real hardware the firmware learns these numbers from the RPM/AOP (over
+ * DAL) and from the DRAM device itself; here the machine simply states them.
+ */
+#define GCC_CORE0_FREQ_KHZ  0x1F00
+#define GCC_DDR_FREQ_KHZ    0x1F04
 
 /*
  * Clock-control blocks driven by the stock (pre-8974) ClockLib that the
@@ -69,6 +95,38 @@ static const struct {
     { 0x0D04, 0x00000000 },
 };
 
+/*
+ * Branch control registers (CBCR).  The UEFI's clock library enables a
+ * clock and then polls the CBCR until its branch state (bits 31:28) reads
+ * "on" (0) or "on, no FSM" (2).  A generic register that was never written
+ * reads back as 0x80000000 here, which would be state 8 and the poll would
+ * never end, so the CBCRs report their branch state as off/on.
+ */
+static const uint32_t msm8992_gcc_branch_regs[] = {
+    0x0280, 0x0284, 0x03C8, 0x03CC, 0x03D0, 0x03FC, 0x0484, 0x0488,
+    0x04AC, 0x04C4, 0x04C8, 0x0504, 0x0508, 0x0544, 0x0548, 0x0584,
+    0x0588, 0x05C4, 0x0644, 0x0648, 0x0684, 0x06C4, 0x06C8, 0x0704,
+    0x0744, 0x0748, 0x0784, 0x07C4, 0x07C8, 0x0804, 0x0844, 0x0848,
+    0x0884, 0x08C4, 0x08C8, 0x0904, 0x0944, 0x0984, 0x0988, 0x09C4,
+    0x0A04, 0x0A08, 0x0A44, 0x0A84, 0x0A88, 0x0AC4, 0x0B04, 0x0B08,
+    0x0B44, 0x0B84, 0x0B88, 0x0BC4, 0x0C04, 0x0C08, 0x0C44, 0x0CC4,
+    0x0CCC, 0x0D04, 0x0D44, 0x0D84, 0x0D88, 0x0E04, 0x10C8, 0x11C0,
+    0x1408, 0x140C, 0x1900, 0x1940, 0x1980, 0x1A84, 0x1AC8, 0x1ACC,
+    0x1AD0, 0x1AD4, 0x1AD8, 0x1B48, 0x1B4C, 0x1B50, 0x1B54, 0x1B58,
+    0x1D48, 0x1D4C, 0x1D50, 0x1D54, 0x1D58, 0x1D5C, 0x1D60, 0x1D64,
+    0x1D7C,
+};
+
+static bool msm8992_gcc_is_branch_reg(uint32_t off)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(msm8992_gcc_branch_regs); i++) {
+        if (off == msm8992_gcc_branch_regs[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool msm8992_gcc_is_ctrl_block(uint32_t off)
 {
     for (size_t i = 0; i < ARRAY_SIZE(msm8992_gcc_ctrl_blocks); i++) {
@@ -101,7 +159,30 @@ static uint64_t msm8992_gcc_read(void *opaque, hwaddr offset, unsigned size)
     {
         size_t word = offset >> 2;
 
+        /*
+         * A firmware poll loop reads the same register over and over; report
+         * an offset the third time it is read so the poll is visible in the
+         * log without drowning it in single reads.
+         */
+        if (s->read_cnt[word] < 0xffff) {
+            s->read_cnt[word]++;
+            if (s->read_cnt[word] == 3) {
+                qemu_log_mask(LOG_UNIMP, "gcc: repeated read 0x%04" HWADDR_PRIx
+                              " = 0x%08" PRIx32 "\n", offset, s->regs[word]);
+            }
+        }
+
         v = s->regs[word];
+        /*
+         * The rate registers are read-only and always report the rate the
+         * machine was configured with.
+         */
+        if (offset == GCC_CORE0_FREQ_KHZ) {
+            return s->core0_freq_khz;
+        }
+        if (offset == GCC_DDR_FREQ_KHZ) {
+            return s->ddr_freq_khz;
+        }
         for (size_t i = 0; i < ARRAY_SIZE(msm8992_gcc_status_regs); i++) {
             if (offset == msm8992_gcc_status_regs[i].off) {
                 return msm8992_gcc_status_regs[i].value;
@@ -140,6 +221,16 @@ static uint64_t msm8992_gcc_read(void *opaque, hwaddr offset, unsigned size)
             qemu_log_mask(LOG_UNIMP, "gcc: read 0x%04" PRIx32 " = 0x%08"
                           PRIx32 " (ctrl)\n", (uint32_t)offset, r);
             return r;
+        }
+        /*
+         * Branch control: the branch state (bits 31:28) of a CBCR reads
+         * "on" - the clock is running.
+         */
+        if (msm8992_gcc_is_branch_reg((uint32_t)offset)) {
+            v &= ~0xF0000000u;
+            qemu_log_mask(LOG_UNIMP, "gcc: read 0x%04" PRIx32 " = 0x%08"
+                          PRIx32 " (branch)\n", (uint32_t)offset, v);
+            return v;
         }
         /*
          * Request bits are cleared by the hardware once the switch is
@@ -218,6 +309,14 @@ static void msm8992_gcc_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->hot_bm, 0, sizeof(s->hot_bm));
     memset(s->upd_bm, 0, sizeof(s->upd_bm));
+    memset(s->read_cnt, 0, sizeof(s->read_cnt));
+}
+
+static void msm8992_gcc_instance_init(Object *obj)
+{
+    Msm8992GccState *s = MSM8992_GCC(obj);
+    s->core0_freq_khz = MSM8992_GCC_PROP_CPU0_FREQ_KHZ;
+    s->ddr_freq_khz   = MSM8992_GCC_PROP_DDR_FREQ_KHZ;
 }
 
 static void msm8992_gcc_class_init(ObjectClass *oc, const void *data)
@@ -226,12 +325,24 @@ static void msm8992_gcc_class_init(ObjectClass *oc, const void *data)
     dc->realize = msm8992_gcc_realize;
     device_class_set_legacy_reset(dc, msm8992_gcc_reset);
     dc->desc = "Qualcomm Global Clock Controller, benign register file";
+
+    object_class_property_add_uint32_ptr(oc, "cpu0-freq-khz",
+            offsetof(Msm8992GccState, core0_freq_khz),
+            OBJ_PROP_FLAG_READWRITE);
+    object_class_property_set_description(oc, "cpu0-freq-khz",
+        "Rate of CPU core 0 in kHz (Snapdragon 808 A53: 1500000)");
+    object_class_property_add_uint32_ptr(oc, "ddr-freq-khz",
+            offsetof(Msm8992GccState, ddr_freq_khz),
+            OBJ_PROP_FLAG_READWRITE);
+    object_class_property_set_description(oc, "ddr-freq-khz",
+        "DRAM clock rate in kHz (LPDDR3-1866: 933000)");
 }
 
 static const TypeInfo msm8992_gcc_info = {
     .name          = TYPE_MSM8992_GCC,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Msm8992GccState),
+    .instance_init = msm8992_gcc_instance_init,
     .class_init    = msm8992_gcc_class_init,
 };
 

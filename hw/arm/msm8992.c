@@ -33,6 +33,7 @@
 #include "qemu/units.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "hw/core/boards.h"
@@ -124,6 +125,8 @@ struct Msm8992MachineState {
     bool secure;                    /* provide EL3 (stock-TZ experiments) */
     bool virt;                      /* provide EL2 */
     bool fullchain;                 /* PBL-stub->SBL1->TZ->UEFI chain mode */
+    uint32_t cpu0_freq_khz;         /* rate of CPU core 0 (A53) */
+    uint32_t ddr_freq_khz;          /* DRAM clock rate (LPDDR3-1866) */
 };
 
 /* GIC PPI inputs sit after the SPI pins: index = num_spi + cpu*32 + INTID,
@@ -925,8 +928,13 @@ static void msm8992_create_stubs(MachineState *ms)
     }
 
     {
+        Msm8992MachineState *s = MSM8992_MACHINE(ms);
         DeviceState *g;
         g = qdev_new("msm8992-gcc");
+        object_property_set_uint(OBJECT(g), "cpu0-freq-khz",
+                                 s->cpu0_freq_khz, &error_fatal);
+        object_property_set_uint(OBJECT(g), "ddr-freq-khz",
+                                 s->ddr_freq_khz, &error_fatal);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(g), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(g), 0, MSM8992_GCC_BASE);
     }
@@ -1055,8 +1063,8 @@ static void msm8992_create_stubs(MachineState *ms)
  *   0xD0  alloc_info[419]       {allocated, offset, size, base_ext}
  *
  * Allocated items we plant:
- *   #9   SMEM_AARM_PARTITION_TABLE @+0x4000 — valid magic, zero parts
  *   #137 SMEM_BOARD_INFO_LOCATION  @+0x5000 — board_info_v8, MSM8992/MTP
+ *   #402 SMEM_USABLE_RAM_PARTITION_TABLE @+0x6000 — RAM partition table
  * Plus the 16-byte smem_addr_info at 0xFE805FF0 (smem_targ_info_imem).
  */
 #define SMEM32_OFF_VERSIONS   0x40
@@ -1064,59 +1072,16 @@ static void msm8992_create_stubs(MachineState *ms)
 #define SMEM32_OFF_ALLOC      0xD0
 #define SMEM_ALLOC_COUNT      419
 #define SMEM_HEAP_FREE_OFF    (SMEM32_OFF_ALLOC + SMEM_ALLOC_COUNT * 16)
-#define SMEM_ITEM_PTABLE      9
 #define SMEM_ITEM_BOARD_INFO  137
 #define SMEM_ITEM_RAM_PTABLE  402   /* SMEM_USABLE_RAM_PARTITION_TABLE */
 #define SMEM_ITEM_CHAN_ALLOC  13    /* SMEM_CHANNEL_ALLOC_TBL */
 #define SMEM_ITEM_SMD_BASE    14    /* SMEM_SMD_BASE_ID: ctrl per cid */
 #define SMEM_ITEM_SMD_FIFO    338   /* SMEM_SMD_FIFO_BASE_ID: fifo per cid */
-#define SMEM_PTABLE_OFF       0x4000
 #define SMEM_BOARD_INFO_OFF   0x5000
 #define SMEM_RAMPT_OFF        0x6000
 #define SMEM_CHAN_TBL_OFF     0x30000
 #define SMEM_SMD_CTRL_OFF     0x31000   /* cid 0: rpm_requests ctrl (88 B) */
 #define SMEM_SMD_FIFO_OFF     0x32000   /* cid 0: fifo (2 KiB) */
-
-static const struct { char name[16]; uint32_t start, size, attr; } msm8992_flash_ptn[] = {
-  {"DPP", 0x00001000, 0x00004000},
-  {"MODEM_FSG", 0x00005000, 0x00000c00},
-  {"MODEM_FS1", 0x00006000, 0x00000c00},
-  {"MODEM_FS2", 0x00007000, 0x00000c00},
-  {"MODEM_FSC", 0x00008000, 0x00000020},
-  {"DDR", 0x00009000, 0x00000800},
-  {"SEC", 0x0000a000, 0x00000100},
-  {"APDP", 0x0000b000, 0x00000200},
-  {"MSADP", 0x0000c000, 0x00000200},
-  {"DPO", 0x0000d000, 0x00000020},
-  {"LogFS", 0x0000e000, 0x00008000},
-  {"SSD", 0x00016000, 0x00000020},
-  {"UEFI_BS_NV", 0x00017000, 0x00000200},
-  {"UEFI_RT_NV", 0x00018000, 0x00000200},
-  {"LIMITS", 0x00019000, 0x00000020},
-  {"SBL1", 0x0001a000, 0x00000800},
-  {"PMIC", 0x0001b000, 0x00000400},
-  {"DBI", 0x0001c000, 0x00000060},
-  {"UEFI", 0x0001d000, 0x00001000},
-  {"RPM", 0x0001e000, 0x000003e8},
-  {"TZ", 0x0001f000, 0x00000800},
-  {"HYP", 0x00020000, 0x000003e8},
-  {"WINSECAPP", 0x00021000, 0x00000400},
-  {"TZAPPS", 0x00022000, 0x00008000},
-  {"BACKUP_SBL1", 0x0002a000, 0x00000800},
-  {"BACKUP_PMIC", 0x0002b000, 0x00000400},
-  {"BACKUP_DBI", 0x0002c000, 0x00000060},
-  {"BACKUP_UEFI", 0x0002d000, 0x00001000},
-  {"BACKUP_RPM", 0x0002e000, 0x000003e8},
-  {"BACKUP_TZ", 0x0002f000, 0x00000800},
-  {"BACKUP_HYP", 0x00030000, 0x000003e8},
-  {"BACKUP_WINSECAP", 0x00031000, 0x00000400},
-  {"BACKUP_TZAPPS", 0x00032000, 0x00008000},
-  {"PLAT", 0x0003a000, 0x00004000},
-  {"EFIESP", 0x0003e000, 0x00010000},
-  {"MMOS", 0x0004e000, 0x00003000},
-  {"MainOS", 0x00054000, 0x0057a800},
-  {"Data", 0x005d0400, 0x03a2ab1e},
-};
 
 static void msm8992_smem_store(uint8_t *ram, hwaddr off, uint32_t val)
 {
@@ -1142,15 +1107,21 @@ static void msm8992_populate_smem(MachineState *ms)
     msm8992_smem_store(base, SMEM32_OFF_HEAP + 8,
                        MSM8992_SMEM_SIZE - SMEM_HEAP_FREE_OFF);
 
-    /* alloc_info[9]: RAM partition table (header-only, no partitions yet) */
-    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_PTABLE * 16 + 0, 1);
-    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_PTABLE * 16 + 4,
-                       SMEM_PTABLE_OFF);
-    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_PTABLE * 16 + 8, 16);
-    msm8992_smem_store(base, SMEM_PTABLE_OFF + 0, 0x55ee73aa);   /* magic1 */
-    msm8992_smem_store(base, SMEM_PTABLE_OFF + 4, 0xe35ebddb);   /* magic2 */
-    msm8992_smem_store(base, SMEM_PTABLE_OFF + 8, 2);            /* version */
-    msm8992_smem_store(base, SMEM_PTABLE_OFF + 12, 0);           /* len */
+    /* alloc_info[9] (SMEM_AARM_PARTITION_TABLE) is deliberately left
+     * unallocated.  It is the legacy LK flash partition table (magic
+     * 0x55ee73aa/0xe35ebddb, 28-byte entries, max 16 entries for v<=3
+     * and 32 for v4), and nothing in this boot chain publishes it:
+     *   - the stock SBL1 contains neither magic word in any encoding, so
+     *     it never writes such a table;
+     *   - the retail UEFI image carries only the *RAM* partition table
+     *     magic (0x9da5e0a8), not the flash one;
+     *   - its only upstream consumer is the NAND driver
+     *     (msm_qpic_nand.c), and this phone has no NAND.
+     * The eMMC layout is described by the GPT on the device itself, which
+     * the UEFI reads through the block device.  Leaving the entry
+     * unallocated makes the guest's SmemPtableDxe take its documented
+     * "no ptable" path instead of asserting on a table that no reader of
+     * this format could consume (the format cannot express 38 entries). */
 
     /* alloc_info[137]: board_info_v8 — makes BoardDxe identify MSM8992/MTP */
     msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_BOARD_INFO * 16 + 0, 1);
@@ -1220,31 +1191,6 @@ static void msm8992_populate_smem(MachineState *ms)
             msm8992_smem_store(base, e + 0x28, 1);          /* APPS_DOMAIN */
             msm8992_smem_store(base, e + 0x2C, 1);          /* SYS_MEMORY */
             msm8992_smem_store(base, e + 0x30, n);          /* num_partitions */
-        }
-    }
-
-    /* item #9: eMMC partition table (smem_ptable, magic 0x55ee73aa/e35ebddb) */
-    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_PTABLE * 16 + 0, 1);
-    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_PTABLE * 16 + 4,
-                       SMEM_PTABLE_OFF);
-    msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_PTABLE * 16 + 8,
-                       16 + (uint32_t)(sizeof(msm8992_flash_ptn)
-                                       / sizeof(msm8992_flash_ptn[0])) * 28);
-    {
-        hwaddr p = SMEM_PTABLE_OFF;
-        unsigned int n = sizeof(msm8992_flash_ptn) / sizeof(msm8992_flash_ptn[0]);
-        unsigned int k;
-        msm8992_smem_store(base, p + 0, 0x55ee73aa);
-        msm8992_smem_store(base, p + 4, 0xe35ebddb);
-        msm8992_smem_store(base, p + 8, 1);            /* version 1 */
-        msm8992_smem_store(base, p + 12, n);           /* len */
-        for (k = 0; k < n; k++) {
-            memcpy(base + p + 16 + k * 28, msm8992_flash_ptn[k].name, 16);
-            msm8992_smem_store(base, p + 16 + k * 28 + 16,
-                               msm8992_flash_ptn[k].start);
-            msm8992_smem_store(base, p + 16 + k * 28 + 20,
-                               msm8992_flash_ptn[k].size);
-            msm8992_smem_store(base, p + 16 + k * 28 + 24, 0);
         }
     }
 
@@ -1762,6 +1708,48 @@ static void msm8992_set_smem(Object *obj, bool value, Error **errp)
     msm8992_smem_enabled = value;
 }
 
+static void msm8992_get_cpu0_freq_khz(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    Msm8992MachineState *s = MSM8992_MACHINE(obj);
+    uint32_t value = s->cpu0_freq_khz;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void msm8992_set_cpu0_freq_khz(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    Msm8992MachineState *s = MSM8992_MACHINE(obj);
+    uint32_t value = s->cpu0_freq_khz;
+
+    visit_type_uint32(v, name, &value, errp);
+    s->cpu0_freq_khz = value;
+}
+
+static void msm8992_get_ddr_freq_khz(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    Msm8992MachineState *s = MSM8992_MACHINE(obj);
+    uint32_t value = s->ddr_freq_khz;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void msm8992_set_ddr_freq_khz(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    Msm8992MachineState *s = MSM8992_MACHINE(obj);
+    uint32_t value = s->ddr_freq_khz;
+
+    visit_type_uint32(v, name, &value, errp);
+    s->ddr_freq_khz = value;
+}
+
 static const CPUArchIdList *msm8992_possible_cpu_arch_ids(MachineState *ms)
 {
     int n;
@@ -1794,6 +1782,12 @@ static void msm8992_instance_init(Object *obj)
     s->secure = true;    /* EL3 resident like the real chain */
     s->virt   = false;
     msm8992_smem_enabled = true;   /* SBL1's SMEM tables emulated by default */
+    /*
+     * Snapdragon 808 (MSM8992) clock rates: cpu0 is a Cortex-A53 (the A53
+     * cluster is up to 1.5 GHz), the DRAM is LPDDR3-1866 = 933 MHz clock.
+     */
+    s->cpu0_freq_khz = 1500000;
+    s->ddr_freq_khz  = 933000;
 }
 
 static void msm8992_machine_class_init(ObjectClass *oc, const void *data)
@@ -1832,6 +1826,17 @@ static void msm8992_machine_class_init(ObjectClass *oc, const void *data)
                                    msm8992_set_smem_trace);
     object_class_property_set_description(oc, "smem",
         "Pre-populate SMEM tables as SBL1 would (default: on)");
+
+    object_class_property_add(oc, "cpu0-freq-khz", "uint32",
+        msm8992_get_cpu0_freq_khz, msm8992_set_cpu0_freq_khz, NULL, NULL);
+    object_class_property_set_description(oc, "cpu0-freq-khz",
+        "Rate of CPU core 0 in kHz (Snapdragon 808 A53: 1500000). Reported "
+        "by the boot firmware as 'Core 0 Frequency'.");
+    object_class_property_add(oc, "ddr-freq-khz", "uint32",
+        msm8992_get_ddr_freq_khz, msm8992_set_ddr_freq_khz, NULL, NULL);
+    object_class_property_set_description(oc, "ddr-freq-khz",
+        "DRAM clock rate in kHz (LPDDR3-1866: 933000). Reported by the boot "
+        "firmware as 'DDR Frequency'.");
 }
 
 static const TypeInfo msm8992_machine_info = {
