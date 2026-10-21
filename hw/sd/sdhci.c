@@ -364,6 +364,25 @@ static void sdhci_send_command(SDHCIState *s)
     request.cmd = s->cmdreg >> 8;
     request.arg = s->argument;
 
+    /*
+     * Auto CMD23 (SDHCI 3.0): the controller tells the card up front how
+     * many blocks the transfer will move, so that the card can end a
+     * multi-block transfer by itself.  A card that never learns the block
+     * count stays in "sending data" forever, and every later command then
+     * fails with "wrong state" - which is what the Lumia 950 firmware
+     * hits when it reads the GPT of the eMMC.
+     */
+    if ((s->trnmod & SDHC_TRNS_ACMD23) && (s->trnmod & SDHC_TRNS_MULTI) &&
+        (request.cmd == 18 || request.cmd == 25) && s->blkcnt) {
+        SDRequest cmd23;
+        uint8_t rsp23[16];
+
+        cmd23.cmd = 0x17;         /* SET_BLOCK_COUNT */
+        cmd23.arg = s->blkcnt;
+        trace_sdhci_send_command(cmd23.cmd, cmd23.arg);
+        sdbus_do_command(&s->sdbus, &cmd23, rsp23, sizeof(rsp23));
+    }
+
     trace_sdhci_send_command(request.cmd, request.arg);
     rlen = sdbus_do_command(&s->sdbus, &request, response, sizeof(response));
 
@@ -1282,9 +1301,19 @@ sdhci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
             /*
              * [14:12] SDMA Buffer Boundary
              * [11:00] Transfer Block Size
+             *
+             * The block size is the low half of the dword at 0x04 and the
+             * block count is its high half, but a driver may also write
+             * the two halves separately as 16 bit registers (the firmware
+             * of the Lumia 950 does).  Only touch the half that was
+             * actually written.
              */
-            MASKED_WRITE(s->blksize, mask, extract32(value, 0, 15));
-            MASKED_WRITE(s->blkcnt, mask >> 16, value >> 16);
+            if (shift < 16) {
+                MASKED_WRITE(s->blksize, mask, extract32(value, 0, 15));
+                MASKED_WRITE(s->blkcnt, mask >> 16, value >> 16);
+            } else {
+                MASKED_WRITE(s->blkcnt, mask >> 16, value >> 16);
+            }
 
             /* Limit block size to the maximum buffer size */
             if (extract32(s->blksize, 0, 12) > s->buf_maxsz) {

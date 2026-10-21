@@ -46,7 +46,15 @@
 #define SDHC_TRNS_ACMD23               0x0008 /* since v3 */
 #define SDHC_TRNS_READ                 0x0010
 #define SDHC_TRNS_MULTI                0x0020
-#define SDHC_TRNMOD_MASK               0x0037
+/*
+ * The transfer mode register carries the auto CMD12 and auto CMD23 bits
+ * (SDHCI 3.0); the mask must keep them, a driver that relies on auto
+ * CMD23 to end a multi block transfer has no other way to tell the card
+ * how many blocks are coming.
+ */
+#define SDHC_TRNMOD_MASK \
+    (SDHC_TRNS_DMA | SDHC_TRNS_BLK_CNT_EN | SDHC_TRNS_ACMD12 | \
+     SDHC_TRNS_ACMD23 | SDHC_TRNS_READ | SDHC_TRNS_MULTI)
 
 /* R/W Command Register 0x0 */
 #define SDHC_CMDREG                    0x0E
