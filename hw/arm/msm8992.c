@@ -84,6 +84,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MachineState, MSM8992_MACHINE)
 
 #define MSM8992_QTIMER_F0   0xF9021000ULL       /* armv7-timer-mem frame 0 */
 #define MSM8992_GCC_BASE    0xFC400000ULL       /* qcom,gcc-8992, len 0x2000 */
+#define MSM8992_PCIE_BASE   0xFF000000ULL       /* PCIe wrapper AXI, len 8 MB */
+#define MSM8992_QUP4_SPI_BASE 0xF9966000ULL     /* BLSP2 QUP4 SPI, len 4 KiB */
 #define MSM8992_TLMM_BASE   0xFD510000ULL       /* qcom,tlmm, len 0x4000 */
 #define MSM8992_SPMI_BASE   0xFC4C0000ULL       /* arbiter; core window +0xF000 */
 #define MSM8992_RPM_MSGRAM  0xFC428000ULL       /* len 0x4000 */
@@ -694,22 +696,21 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
     sysbus_mmio_map(sdcc_sbd, 6, MSM8992_SDC1_BASE + 0x100);  /* vendor regs */
 
     /*
-     * One SDCC interrupt line to the APPS (SDCC1_PWRCTL_IRQ, INTID 170):
-     * the card interrupt of the SDHCI block and the power event of the
-     * SDCC core share it on the real chip.
+     * Two interrupt lines of SDC1, as on the real chip:
+     *
+     *   - the card interrupt of the SDHCI block (SPI 123, INTID 155) -
+     *     the same line the legacy MCI view of the controller uses;
+     *   - the power event of the SDCC core (SDCC1_PWRCTL_IRQ, INTID 170).
+     *
+     * They must stay apart: the UEFI's MMCHS driver registers a handler
+     * for the *power* line only and polls the SDHCI status registers for
+     * the card.  With both lines merged, a card interrupt that is still
+     * pending keeps the power line asserted and the guest spins in the
+     * power handler instead of ever polling the transfer - the eMMC then
+     * stays in "sendingdata" and every later command times out.
      */
-    {
-        DeviceState *orgate = qdev_new(TYPE_OR_IRQ);
-
-        qdev_prop_set_uint16(orgate, "num-lines", 2);
-        qdev_realize(orgate, NULL, &error_fatal);
-        sysbus_connect_irq(sdhci_sbd, 0,
-                           qdev_get_gpio_in(orgate, 0));
-        sysbus_connect_irq(sdcc_sbd, 0,
-                           qdev_get_gpio_in(orgate, 1));
-        qdev_connect_gpio_out(orgate, 0,
-                              gic_spi[MSM8992_SDC1_SDHCI_IRQ]);
-    }
+    sysbus_connect_irq(sdhci_sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
+    sysbus_connect_irq(sdcc_sbd, 0, gic_spi[MSM8992_SDC1_SDHCI_IRQ]);
 
     if (!fullchain) {
         create_unimplemented_device("sdhc1-vendor-cfg", MSM8992_SDC1_CONF,
@@ -939,6 +940,26 @@ static void msm8992_create_stubs(MachineState *ms)
         sysbus_mmio_map(SYS_BUS_DEVICE(g), 0, MSM8992_GCC_BASE);
     }
     /*
+     * BLSP2 QUP4 SPI (the SPI block the firmware's QupSpiDxe drives).
+     */
+    {
+        DeviceState *g = qdev_new("msm8992-qup");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(g), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(g), 0, MSM8992_QUP4_SPI_BASE);
+    }
+    /*
+     * The PCIe wrapper / DM core window.  The firmware's
+     * PCIExpressConfiguratorDxe programs it before the boot manager runs,
+     * and the platform memory map reserves 0xFF000000..0xFF7FFFFF for it
+     * ("PCIE WRAPPER AXI"), so the guest would take a data abort if the
+     * window were not there at all.
+     */
+    {
+        DeviceState *g = qdev_new("msm8992-pcie");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(g), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(g), 0, MSM8992_PCIE_BASE);
+    }
+    /*
      * Carpet-stub the whole QGIC/APCS chipset window (DeviceMemoryMap.h
      * "TERMINATOR" 0xF9000000+0x113000): the real GIC dist/cpu, QTimer and
      * the APCS doorbell pad are mapped at priority 0 and win over this
@@ -1086,6 +1107,87 @@ static void msm8992_create_stubs(MachineState *ms)
 static void msm8992_smem_store(uint8_t *ram, hwaddr off, uint32_t val)
 {
     stl_le_p(ram + off, val);
+}
+
+/*
+ * The preloader environment - the "Preloader Block" the platform memory map
+ * reserves at 0xB0000000 (4 KiB, Lumia950XLPkg
+ * Include/Configuration/DeviceMemoryMap.h).
+ *
+ * On the phone the *stock* UEFI (Microsoft's application loader) publishes
+ * this block before the community UEFI starts: the 'BSEN' magic, the loader
+ * version, the boot time and the display info.  The community UEFI's
+ * PreLoaderDxe checks the magic and the version and republishes the display
+ * info as the "UEFIDisplayInfo" variable; with an empty block it stops at
+ * the "BootShim version check fail" screen and never reaches BdsDxe.
+ *
+ * Our chain has no stock UEFI - the TrustZone hand-off goes straight to the
+ * community firmware - so the machine provides the block.  Layout
+ * (Lumia950XLPkg Include/Configuration/Hob.h):
+ *
+ *   +0x00 UINT32  Header             'BSEN'
+ *   +0x04 UINT32  PreloaderVersion   the guest requires >= 0x1000
+ *   +0x08 CHAR8   PreloaderRelease[64]
+ *   +0x48 EFI_TIME BootTimeEpoch     (16 bytes)
+ *   +0x58 UINT32  UefiDisplayInfo[30] (120 bytes, stock UEFI layout)
+ *   +0xD0 UINT32  Crc32
+ *
+ * The guest does not verify the CRC and does not read the display info
+ * (it only copies it into a variable the stock stack would consume), so the
+ * display info is left empty here.
+ */
+#define PRELOADER_ENV_BASE    0xB0000000ULL
+#define PRELOADER_ENV_SIZE    0x1000
+#define PRELOADER_ENV_HEADER  0x4E455342u    /* 'B', 'S', 'E', 'N' */
+#define PRELOADER_ENV_VERSION 0x1000u        /* PRELOADER_VERSION_MIN */
+#define PRELOADER_ENV_CRC_OFF  0xD0
+#define PRELOADER_ENV_SIZE_OF  0xD4           /* sizeof(PRELOADER_ENVIRONMENT) */
+
+/*
+ * ITU-T V.42 CRC-32 - the algorithm of EDK2's CalculateCrc32(), which the
+ * UEFI's PrePi uses to validate the preloader environment (the Crc32 field
+ * is zeroed while it computes the checksum over the whole structure).
+ */
+static uint32_t msm8992_crc32(const uint8_t *buf, size_t len)
+{
+    static const uint32_t table[16] = {
+        0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
+        0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
+        0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
+        0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c,
+    };
+    uint32_t crc = 0xffffffff;
+
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        crc = (crc >> 4) ^ table[crc & 0xf];
+        crc = (crc >> 4) ^ table[crc & 0xf];
+    }
+    return crc ^ 0xffffffff;
+}
+
+static void msm8992_populate_preloader_env(MachineState *ms)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(ms->ram);
+    uint8_t *env = ram + PRELOADER_ENV_BASE;
+    uint32_t crc;
+
+    memset(env, 0, PRELOADER_ENV_SIZE);
+    stl_le_p(env + 0x00, PRELOADER_ENV_HEADER);
+    stl_le_p(env + 0x04, PRELOADER_ENV_VERSION);
+    memcpy(env + 0x08, "Lumia950 preloader environment (QEMU msm8992 model)",
+           sizeof("Lumia950 preloader environment (QEMU msm8992 model)") - 1);
+
+    /* EFI_TIME BootTimeEpoch: the moment the chain started */
+    stl_le_p(env + 0x48, 2026);     /* Year */
+    env[0x4C] = 1;                  /* Month */
+    env[0x4D] = 1;                  /* Day */
+    stl_le_p(env + 0x50, 0);        /* Nanosecond */
+    stl_le_p(env + 0x54, 0);        /* TimeZone (UTC) */
+
+    /* The CRC covers the whole structure with the Crc32 field zeroed */
+    crc = msm8992_crc32(env, PRELOADER_ENV_SIZE_OF);
+    stl_le_p(env + PRELOADER_ENV_CRC_OFF, crc);
 }
 
 static MemoryRegion *msm8992_imem_mr;
@@ -1493,6 +1595,7 @@ static void msm8992_init(MachineState *machine)
     if (msm8992_smem_enabled) {
         msm8992_populate_smem(machine);
     }
+    msm8992_populate_preloader_env(machine);
     msm8992_smem_trace_prepare(machine);
 
     msm8992_create_cpus(s, machine);

@@ -207,6 +207,12 @@ config MSM8992_APCS
 config MSM8992_SMDGHOST
     bool
 
+config MSM8992_PCIE
+    bool
+
+config MSM8992_QUP
+    bool
+
 config UNIMP
     bool
 
