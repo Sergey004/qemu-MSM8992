@@ -80,6 +80,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MachineState, MSM8992_MACHINE)
  * without one.  64 KiB below 1 MiB: below the UEFI FV (0x200000) and the
  * framebuffer window, above the low scratch area. */
 #define MSM8992_BOOT_STACK_TOP 0x00100000ULL
+/* Where the machine parks the secondary CPUs.  A real bootloader leaves
+ * them spinning (PBL/SBL1 park them until the firmware asks for them via
+ * PSCI); without it the secondaries execute the QEMU -kernel boot stub at
+ * address 0 and barge into the firmware concurrently - with the stock
+ * 32-bit UEFI that races the SEC phase into "Detected Stack Corruption"
+ * and the PrePiHobLib assert loop.  The stub is AArch64 (the state the
+ * secondaries reset into): wfi; b .-4.  PSCI CPU_ON re-points them later. */
+#define MSM8992_SMP_PARK    0x00070000ULL
 #define MSM8992_SMEM_BASE   0x06A00000ULL       /* inside DRAM, 0x200000 bytes */
 #define MSM8992_SMEM_SIZE   0x200000ULL
 #define MSM8992_TARG_INFO   0xFE805000ULL       /* smem_targ_info_imem page (DT) */
@@ -1686,6 +1694,13 @@ static int32_t msm8992_scm_call(ARMCPU *cpu, uint64_t id, uint64_t a1,
     return 0;
 }
 
+/* Park every non-primary CPU in the wfi stub at MSM8992_SMP_PARK. */
+static void msm8992_secondary_park(ARMCPU *cpu,
+                                   const struct arm_boot_info *info)
+{
+    cpu_set_pc(CPU(cpu), MSM8992_SMP_PARK);
+}
+
 static void msm8992_init(MachineState *machine)
 {
     Msm8992MachineState *s = MSM8992_MACHINE(machine);
@@ -1851,6 +1866,20 @@ static void msm8992_init(MachineState *machine)
      */
     if (!s->fullchain) {
         arm_register_smc_vendor_handler(msm8992_scm_call);
+    }
+
+    /*
+     * Park the secondary CPUs at a wfi stub: their reset PC is 0, which in
+     * the -kernel lanes holds QEMU's AArch64 boot stub - the secondaries
+     * would otherwise run the firmware entry concurrently with CPU0 (see
+     * MSM8992_SMP_PARK above).  Written before the system reset, the reset
+     * hook then points every non-primary CPU at it.
+     */
+    {
+        uint8_t *park = memory_region_get_ram_ptr(machine->ram) + MSM8992_SMP_PARK;
+        stl_le_p(park + 0, 0xd503207f);         /* wfi */
+        stl_le_p(park + 4, 0x17ffffff);         /* b .-4 */
+        s->bootinfo.secondary_cpu_reset_hook = msm8992_secondary_park;
     }
 
     if (machine->kernel_filename) {

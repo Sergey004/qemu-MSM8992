@@ -690,31 +690,41 @@ static void do_cpu_reset(void *opaque)
                 g_assert_not_reached();
             }
 
-            if (info->aa32_entry) {
-                /* A32 SVC entry at EL1 for the 32-bit image */
-                env->aarch64 = false;
-                env->uncached_cpsr = ARM_CPU_MODE_SVC | CPSR_I | CPSR_F
-                                     | CPSR_A;
+            if (cpu == info->primary_cpu) {
+                if (info->aa32_entry) {
+                    /* A32 SVC entry at EL1 for the 32-bit image */
+                    env->aarch64 = false;
+                    env->uncached_cpsr = ARM_CPU_MODE_SVC | CPSR_I | CPSR_F
+                                         | CPSR_A;
+                    /*
+                     * A bootloader hands the firmware a boot stack; a bare ELF
+                     * entry does not, and the stock 32-bit UEFI checks its stack
+                     * canary in the first instructions ("Detected Stack
+                     * Corruption" from QcomBaseLib).  The board tells us where
+                     * the stack lives.
+                     */
+                    if (info->aa32_stack_top) {
+                        env->regs[13] = info->aa32_stack_top;
+                    }
+                    cpu_set_pc(cs, entry);
+                    arm_rebuild_hflags(env);
+                } else {
+                    cpu_set_pc(cs, entry);
+                    /* Board request: drop to a specific EL for this image
+                     * (what a QC TZ/SBL1 would have done by hand). */
+                    if (info->target_el > 0 &&
+                        arm_feature(env, ARM_FEATURE_EL3)) {
+                        arm_emulate_firmware_reset(cs, info->target_el);
+                    }
+                }
+            } else if (info->secondary_cpu_reset_hook) {
                 /*
-                 * A bootloader hands the firmware a boot stack; a bare ELF
-                 * entry does not, and the stock 32-bit UEFI checks its stack
-                 * canary in the first instructions ("Detected Stack
-                 * Corruption" from QcomBaseLib).  The board tells us where
-                 * the stack lives.
+                 * A firmware entry is single-CPU: the bootloader parks the
+                 * secondaries until the firmware asks for them (PSCI).  Left
+                 * alone they would run the firmware entry concurrently with
+                 * CPU0 and corrupt its SEC phase.
                  */
-                if (info->aa32_stack_top) {
-                    env->regs[13] = info->aa32_stack_top;
-                }
-                cpu_set_pc(cs, entry);
-                arm_rebuild_hflags(env);
-            } else {
-                cpu_set_pc(cs, entry);
-                /* Board request: drop to a specific EL for this image
-                 * (what a QC TZ/SBL1 would have done by hand). */
-                if (info->target_el > 0 &&
-                    arm_feature(env, ARM_FEATURE_EL3)) {
-                    arm_emulate_firmware_reset(cs, info->target_el);
-                }
+                info->secondary_cpu_reset_hook(cpu, info);
             }
         } else {
             /*
