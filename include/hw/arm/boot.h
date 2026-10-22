@@ -68,6 +68,11 @@ struct arm_boot_info {
     /* msm8992: entry image is a 32-bit ARM ELF (stock W10M/UEFI chain);
      * start the A53 in AArch32 SVC instead of AArch64. */
     bool aa32_entry;
+    /* msm8992: initial stack pointer for the AArch32 entry path.  A real
+     * bootloader hands the firmware a boot stack (the PBL shared data
+     * carries its base and size); a bare ELF entry gets none, and the
+     * stock UEFI's stack canary check fires immediately without it. */
+    hwaddr aa32_stack_top;
     int (*atag_board)(const struct arm_boot_info *info, void *p);
     /* multicore boards that use the default secondary core boot functions
      * can ignore these two function calls. If the default functions won't

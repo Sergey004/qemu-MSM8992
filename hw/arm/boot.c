@@ -695,6 +695,16 @@ static void do_cpu_reset(void *opaque)
                 env->aarch64 = false;
                 env->uncached_cpsr = ARM_CPU_MODE_SVC | CPSR_I | CPSR_F
                                      | CPSR_A;
+                /*
+                 * A bootloader hands the firmware a boot stack; a bare ELF
+                 * entry does not, and the stock 32-bit UEFI checks its stack
+                 * canary in the first instructions ("Detected Stack
+                 * Corruption" from QcomBaseLib).  The board tells us where
+                 * the stack lives.
+                 */
+                if (info->aa32_stack_top) {
+                    env->regs[13] = info->aa32_stack_top;
+                }
                 cpu_set_pc(cs, entry);
                 arm_rebuild_hflags(env);
             } else {
@@ -939,6 +949,13 @@ static void arm_setup_direct_kernel_boot(ARMCPU *cpu,
                 eh[18] == 0x28 && eh[19] == 0x00 /* EM_ARM */) {
                 elf_machine = EM_ARM;
                 info->aa32_entry = true;
+                /*
+                 * A firmware image is not a Linux kernel: it must not get
+                 * QEMU's generated device tree.  The autoloaded DTB lands
+                 * at loader_start (address 0), which is where the stock
+                 * UEFI's boot stack lives.
+                 */
+                info->skip_dtb_autoload = true;
             }
             if (kf) {
                 fclose(kf);

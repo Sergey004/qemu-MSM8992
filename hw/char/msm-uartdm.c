@@ -50,6 +50,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmUartDmState, MSM_UARTDM)
 #define UARTDM_RF_TF1     0x74
 #define UARTDM_RF_TF2     0x78
 #define UARTDM_RF_TF3     0x7C
+#define UARTDM_CR         0x0C    /* command register (msm_serial.c) */
 #define UARTDM_MISR_CR    0x10    /* write: CR, read: MISR */
 #define UARTDM_IMR_ISR    0x14    /* write: IMR, read: ISR */
 #define UARTDM_IPR        0x18
@@ -215,6 +216,7 @@ static void msm_uartdm_write(void *opaque, hwaddr offset, uint64_t value,
     case UARTDM_MR2: s->mr2 = value; break;
     case UARTDM_CSR_SR: s->csr = value; break;
     case UARTDM_MISR_CR:
+    case UARTDM_CR:
     case UARTDM2_CR: {
         uint32_t cmd = value & CR_CMD_MASK;
         if (cmd == CR_CMD_RESET_RX) {
