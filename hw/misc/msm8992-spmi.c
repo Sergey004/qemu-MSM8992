@@ -67,11 +67,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992SpmiState, MSM8992_SPMI)
  * PM8x41 driver to notice the side keys. */
 #define PMIC_REG_PON_INT_RT_STS 0x810
 /*
- * The power key of the phone is the GPIO 3 of the PMIC: the firmware
- * polls the status register of that GPIO peripheral (0xC000 + (3-1)*0x100
- * + 0x08) and takes bit 0 as "pressed".
+ * The side keys of the PMIC:
+ *   - the power key is the PON interrupt status (PON_INT_RT_STS, bit 0),
+ *   - "volume up" is GPIO 3 and "camera" is GPIO 4; their status
+ *     registers are active low.
  */
 #define PMIC_REG_GPIO3_STATUS 0xC208
+#define PMIC_REG_GPIO4_STATUS 0xC308
 #define PMIC_PON_INT_KPDPWR   0x01
 #define PMIC_PON_INT_RESIN    0x02
 #define PMIC_REG_PON_TYPE  0x804   /* PERPH_TYPE: PM_HW_MODULE_PON = 1 */
@@ -97,6 +99,8 @@ typedef struct Msm8992SpmiState {
     MemoryRegion iomem;
     uint32_t regs[SPMI_SIZE / 4];
     bool pwrkey_pressed;   /* the power key is held down */
+    bool volup_pressed;    /* the volume up key is held down */
+    bool camera_pressed;   /* the camera key is held down */
     bool tran_done[SPMI_NUM_CH];
     uint32_t rdata[SPMI_NUM_CH][2];
     uint32_t wdata[SPMI_NUM_CH][2];
@@ -231,8 +235,11 @@ static uint8_t msm8992_pmic_read_byte(Msm8992SpmiState *s, unsigned sid,
     case PMIC_REG_PON_INT_RT_STS:
         return s->pwrkey_pressed ? PMIC_PON_INT_KPDPWR : 0x00;
     case PMIC_REG_GPIO3_STATUS:
-        /* the power key, read through the PMIC's GPIO 3 */
-        return s->pwrkey_pressed ? 0x01 : 0x00;
+        /* volume up, active low: 0 means pressed */
+        return s->volup_pressed ? 0x00 : 0x01;
+    case PMIC_REG_GPIO4_STATUS:
+        /* camera key, active low: 0 means pressed */
+        return s->camera_pressed ? 0x00 : 0x01;
     case PMIC_REG_CHG_STAT1: return 0x01;   /* "ready" bit polled by the driver */
     case PMIC_REG_CHG_STAT2: return 0x01;
     case PMIC_REG_CHG_STAT3: return 0x09;
@@ -361,6 +368,26 @@ static void msm8992_spmi_set_pwrkey(Object *obj, bool value, Error **errp)
     s->pwrkey_pressed = value;
 }
 
+static bool msm8992_spmi_get_volup(Object *obj, Error **errp)
+{
+    return MSM8992_SPMI(obj)->volup_pressed;
+}
+
+static void msm8992_spmi_set_volup(Object *obj, bool value, Error **errp)
+{
+    MSM8992_SPMI(obj)->volup_pressed = value;
+}
+
+static bool msm8992_spmi_get_camera(Object *obj, Error **errp)
+{
+    return MSM8992_SPMI(obj)->camera_pressed;
+}
+
+static void msm8992_spmi_set_camera(Object *obj, bool value, Error **errp)
+{
+    MSM8992_SPMI(obj)->camera_pressed = value;
+}
+
 static void msm8992_spmi_instance_init(Object *obj)
 {
     /*
@@ -373,6 +400,12 @@ static void msm8992_spmi_instance_init(Object *obj)
     object_property_add_bool(obj, "power-key-pressed",
                               msm8992_spmi_get_pwrkey,
                               msm8992_spmi_set_pwrkey);
+    object_property_add_bool(obj, "volume-up-pressed",
+                              msm8992_spmi_get_volup,
+                              msm8992_spmi_set_volup);
+    object_property_add_bool(obj, "camera-pressed",
+                              msm8992_spmi_get_camera,
+                              msm8992_spmi_set_camera);
 }
 
 static void msm8992_spmi_realize(DeviceState *dev, Error **errp)

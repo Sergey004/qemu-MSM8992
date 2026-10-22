@@ -114,10 +114,15 @@ int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
 
     target_cpu = ARM_CPU(target_cpu_state);
     if (target_cpu->power_state == PSCI_ON) {
+        /*
+         * The core is running (the firmware parks the secondary CPUs in
+         * a WFE loop).  The TrustZone of the phone restarts a running
+         * core for CPU_ON instead of failing, and the kernel relies on
+         * that, so do the same here.
+         */
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "[ARM]%s: CPU %" PRId64 " is already on\n",
+                      "[ARM]%s: CPU %" PRId64 " is already on, restarting it\n",
                       __func__, cpuid);
-        return QEMU_ARM_POWERCTL_ALREADY_ON;
     }
 
     /*
@@ -207,10 +212,15 @@ int arm_set_cpu_on_and_reset(uint64_t cpuid)
 
     target_cpu = ARM_CPU(target_cpu_state);
     if (target_cpu->power_state == PSCI_ON) {
+        /*
+         * The core is running (the firmware parks the secondary CPUs in
+         * a WFE loop).  The TrustZone of the phone restarts a running
+         * core for CPU_ON instead of failing, and the kernel relies on
+         * that, so do the same here.
+         */
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "[ARM]%s: CPU %" PRId64 " is already on\n",
+                      "[ARM]%s: CPU %" PRId64 " is already on, restarting it\n",
                       __func__, cpuid);
-        return QEMU_ARM_POWERCTL_ALREADY_ON;
     }
 
     /*
