@@ -1701,6 +1701,13 @@ static void msm8992_secondary_park(ARMCPU *cpu,
     cpu_set_pc(CPU(cpu), MSM8992_SMP_PARK);
 }
 
+void msm8992_reset_probe(Msm8992MachineState *s);
+void msm8992_reset_probe(Msm8992MachineState *s)
+{
+    fprintf(stderr, "[msm8992] reset probe: hook=%p\n",
+            (void *)s->bootinfo.secondary_cpu_reset_hook);
+}
+
 static void msm8992_init(MachineState *machine)
 {
     Msm8992MachineState *s = MSM8992_MACHINE(machine);
@@ -1879,7 +1886,6 @@ static void msm8992_init(MachineState *machine)
         uint8_t *park = memory_region_get_ram_ptr(machine->ram) + MSM8992_SMP_PARK;
         stl_le_p(park + 0, 0xd503207f);         /* wfi */
         stl_le_p(park + 4, 0x17ffffff);         /* b .-4 */
-        s->bootinfo.secondary_cpu_reset_hook = msm8992_secondary_park;
     }
 
     if (machine->kernel_filename) {
@@ -1914,6 +1920,13 @@ static void msm8992_init(MachineState *machine)
         }
         arm_load_kernel(ARM_CPU(&s->cpu[MSM8992_BOOT_CPU]), machine,
                         &s->bootinfo);
+        /*
+         * arm_load_kernel() clears secondary_cpu_reset_hook for non-Linux
+         * boots ("no secondary boot stub"); re-arm it afterwards so every
+         * non-primary CPU parks in the wfi stub instead of running QEMU's
+         * boot stub at address 0 concurrently with the firmware.
+         */
+        s->bootinfo.secondary_cpu_reset_hook = msm8992_secondary_park;
         /*
          * Without an EL3/EL2 firmware ROM, hardware starts at the EL the
          * image was linked for; also honor -device loader images.
