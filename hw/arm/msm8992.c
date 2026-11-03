@@ -700,77 +700,107 @@ static void msm8992_create_uart16550(Msm8992MachineState *s, qemu_irq *gic_spi)
  * line asserted and the guest would spend all its time in the interrupt
  * handler.
  */
+/*
+ * Resolve the embedded generic-sdhci of an msm8992-sdcc container ("sdhci"
+ * child object), or NULL when dev is not a container (e.g. the legacy pl181).
+ */
+static SDHCIState *msm8992_sdhci_of(DeviceState *dev)
+{
+    Object *child = object_resolve_path_component(OBJECT(dev), "sdhci");
+
+    return (SDHCIState *)object_dynamic_cast(child, TYPE_SYSBUS_SDHCI);
+}
+
+/*
+ * The device that owns the sd-bus of a host: for the msm8992-sdcc container
+ * it is the embedded "sdhci" child, for everything else (legacy pl181, plain
+ * SDHCI) it is the device itself.
+ */
+static DeviceState *msm8992_sdbus_owner(DeviceState *dev)
+{
+    SDHCIState *child = msm8992_sdhci_of(dev);
+
+    return child ? DEVICE(child) : dev;
+}
+
+/*
+ * History: this used to zero norintstsen to keep the merged card+power IRQ
+ * line from latching.  The msm8992-sdcc container now keeps the card
+ * interrupt (INTID 155) and the power event (INTID 170) on separate lines,
+ * so the status-enable bits must stay at their reset values - the UEFI
+ * MMCHS driver polls NORINTSTS for command completion.
+ */
 static void msm8992_sdhci_polled(DeviceState *dev)
 {
-    SDHCIState *s = (SDHCIState *)object_dynamic_cast(OBJECT(dev),
-                                                    TYPE_SYSBUS_SDHCI);
-
-    if (s) {
-        s->norintstsen = 0;
-    }
+    (void)dev;
 }
 
 static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
                                 bool fullchain)
 {
     SysBusDevice *sbd;
-    SysBusDevice *sdhci_sbd;
     SysBusDevice *sdcc_sbd;
     DeviceState *sdc1_host;
-    DeviceState *sdc1_sdhci;
     DeviceState *sdcc;
 
     /* eMMC boot device; attach the pre-flashed GPT image via -drive if=sd.
      * Two register banks on the same controller: legacy MCI (PL181-like)
      * @0xF9824000 (retail SBL1's path) and SDHCI @0xF9824900 (UEFI's path).
      * The two banks share the card, so both hosts need one. */
+    DeviceState *sdc1_legacy = NULL;
+
     if (fullchain) {
         /* the retail SBL1 drives the legacy MCI bank */
-        sdc1_host = qdev_new("pl181");
-        sbd = SYS_BUS_DEVICE(sdc1_host);
+        sdc1_legacy = qdev_new("pl181");
+        sbd = SYS_BUS_DEVICE(sdc1_legacy);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, MSM8992_SDC1_CONF);
         sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
 
-        /* The UEFI's MMCHS driver always drives the SDHCI bank of the
-         * controller - in the fullchain lane it is the second host next to
-         * the legacy MCI the SBL1 uses. */
-        sdc1_sdhci = qdev_new(TYPE_SYSBUS_SDHCI);
-        sdhci_sbd = SYS_BUS_DEVICE(sdc1_sdhci);
-        sysbus_realize_and_unref(sdhci_sbd, &error_fatal);
-        sysbus_mmio_map(sdhci_sbd, 0, MSM8992_SDC1_BASE);
-        msm8992_sdhci_polled(sdc1_sdhci);
+        /* The UEFI's MMCHS driver drives the SDHCI bank of the controller.
+         * Use the msm8992-sdcc container which includes generic-sdhci
+         * at offset 0x000 and vendor registers at 0x100..0xBFF in a single
+         * 0xC00-byte window at the SDHCI base (0xF9824900). */
+        sdc1_host = qdev_new("msm8992-sdcc");
     } else {
         /*
          * Direct-kernel lane (QEMU boots an Image/DTB itself): exactly one
          * SDHCI host owns the card, so the guest sees it as mmc0 and the
          * phone's GPT as /dev/mmcblk0pNN - and the controller has an
          * interrupt line, which the Linux sdhci-pltfrm driver requires.
+         * Use the same container device for consistency.
          */
-        sdc1_host = s->sdc1 = qdev_new(TYPE_SYSBUS_SDHCI);
-        sbd = SYS_BUS_DEVICE(sdc1_host);
-        sysbus_realize_and_unref(sbd, &error_fatal);
-        sysbus_mmio_map(sbd, 0, MSM8992_SDC1_BASE);
-        sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
+        sdc1_host = s->sdc1 = qdev_new("msm8992-sdcc");
     }
+
+    sbd = SYS_BUS_DEVICE(sdc1_host);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    /* The msm8992-sdcc container maps its combined window at the SDHCI base. */
+    sysbus_mmio_map(sbd, 0, MSM8992_SDC1_BASE);
+    msm8992_sdhci_polled(sdc1_host);
 
     /*
      * SDCC core registers (MCI_VERSION, SDCC_MCI_HC_MODE, PWRCTL) and the
      * Qualcomm vendor registers of the SDHCI block.  The core registers
      * share their window with the legacy MCI model, so they are mapped as
      * single dwords with a higher priority.
+     * These are provided by the SAME msm8992-sdcc container device.
      */
     sdcc = qdev_new("msm8992-sdcc");
     sdcc_sbd = SYS_BUS_DEVICE(sdcc);
     sysbus_realize_and_unref(sdcc_sbd, &error_fatal);
-    /* the region order is the order of sysbus_init_mmio() in the device */
-    sysbus_mmio_map(sdcc_sbd, 0, MSM8992_SDC1_CONF + 0x50);  /* MCI_VERSION */
-    sysbus_mmio_map(sdcc_sbd, 1, MSM8992_SDC1_CONF + 0x78);  /* HC_MODE */
-    sysbus_mmio_map(sdcc_sbd, 2, MSM8992_SDC1_CONF + 0xDC);  /* PWRCTL status */
-    sysbus_mmio_map(sdcc_sbd, 3, MSM8992_SDC1_CONF + 0xE0);  /* PWRCTL mask */
-    sysbus_mmio_map(sdcc_sbd, 4, MSM8992_SDC1_CONF + 0xE4);  /* PWRCTL clear */
-    sysbus_mmio_map(sdcc_sbd, 5, MSM8992_SDC1_CONF + 0xE8);  /* PWRCTL ctl */
-    sysbus_mmio_map(sdcc_sbd, 6, MSM8992_SDC1_BASE + 0x100);  /* vendor regs */
+    /*
+     * Region 0 of msm8992-sdcc is the SDHCI+vendor container; the SDCC core
+     * registers are regions 1..6.  Map only those (the container of this
+     * second instance stays unused - the first instance provides the
+     * SDHCI+vendor window at SDC1_BASE).
+     */
+    sysbus_mmio_map(sdcc_sbd, 1, MSM8992_SDC1_CONF + 0x50);  /* MCI_VERSION */
+    sysbus_mmio_map(sdcc_sbd, 2, MSM8992_SDC1_CONF + 0x78);  /* HC_MODE */
+    sysbus_mmio_map(sdcc_sbd, 3, MSM8992_SDC1_CONF + 0xDC);  /* PWRCTL status */
+    sysbus_mmio_map(sdcc_sbd, 4, MSM8992_SDC1_CONF + 0xE0);  /* PWRCTL mask */
+    sysbus_mmio_map(sdcc_sbd, 5, MSM8992_SDC1_CONF + 0xE4);  /* PWRCTL clear */
+    sysbus_mmio_map(sdcc_sbd, 6, MSM8992_SDC1_CONF + 0xE8);  /* PWRCTL ctl */
 
     /*
      * Two interrupt lines of SDC1, as on the real chip:
@@ -779,15 +809,12 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
      *     the same line the legacy MCI view of the controller uses;
      *   - the power event of the SDCC core (SDCC1_PWRCTL_IRQ, INTID 170).
      *
-     * They must stay apart: the UEFI's MMCHS driver registers a handler
-     * for the *power* line only and polls the SDHCI status registers for
-     * the card.  With both lines merged, a card interrupt that is still
-     * pending keeps the power line asserted and the guest spins in the
-     * power handler instead of ever polling the transfer - the eMMC then
-     * stays in "sendingdata" and every later command times out.
+     * The msm8992-sdcc container combines both into a single IRQ output.
+     * We connect the SDHCI+vendorf instance to the legacy MCI IRQ (INTID 155).
+     * We connect the core-register instance to the power IRQ (INTID 170).
      */
     if (fullchain) {
-        sysbus_connect_irq(sdhci_sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
+        sysbus_connect_irq(sbd, 0, gic_spi[MSM8992_SDC1_IRQ]);
     }
     sysbus_connect_irq(sdcc_sbd, 0, gic_spi[MSM8992_SDC1_SDHCI_IRQ]);
 
@@ -813,16 +840,15 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
                                     blk_by_legacy_dinfo(dinfo),
                                     &error_fatal);
             if (!qdev_realize(DEVICE(card),
-                              BUS(qdev_get_child_bus(sdc1_host, "sd-bus")),
+                              BUS(qdev_get_child_bus(msm8992_sdbus_owner(sdc1_host), "sd-bus")),
                               &error_fatal))
                 g_assert_not_reached();
           } else {
             /*
-             * The second host (UEFI's SDHCI) needs to see the same eMMC,
-             * but a legacy drive can only be attached to one device.  Give
-             * it a snapshot view of the very same image - the retail SBL1
-             * has already finished with the card by the time the UEFI
-             * runs, and the writes go to a temporary file.
+             * The UEFI's SDHCI (inside the msm8992-sdcc container) needs
+             * to see the same eMMC. The retail SBL1 has already finished
+             * with the card by the time the UEFI runs. Give the UEFI's
+             * SDHCI a snapshot view of the same image.
              */
             const char *path = qemu_opt_get(dinfo->opts, "file");
             BlockBackend *be;
@@ -842,7 +868,7 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
             card2 = qdev_new(TYPE_EMMC);
             qdev_prop_set_drive_err(card2, "drive", be, &error_fatal);
             if (!qdev_realize(DEVICE(card2),
-                              BUS(qdev_get_child_bus(sdc1_sdhci, "sd-bus")),
+                              BUS(qdev_get_child_bus(msm8992_sdbus_owner(sdc1_host), "sd-bus")),
                               &error_fatal))
                 g_assert_not_reached();
 
@@ -854,7 +880,7 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
                                         blk_by_legacy_dinfo(dinfo),
                                         &error_fatal);
                 if (!qdev_realize(DEVICE(card),
-                                  BUS(qdev_get_child_bus(sdc1_host, "sd-bus")),
+                                  BUS(qdev_get_child_bus(sdc1_legacy, "sd-bus")),
                                   &error_fatal))
                     g_assert_not_reached();
             }
@@ -870,23 +896,25 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
         SysBusDevice *sbd2;
         SysBusDevice *sdcc2_sbd;
         DeviceState *sdcc2;
+        DeviceState *sdc2_sdhci;
 
-        s->sdc2 = qdev_new(TYPE_SYSBUS_SDHCI);
-        sbd2 = SYS_BUS_DEVICE(s->sdc2);
+        sdc2_sdhci = qdev_new("msm8992-sdcc");
+        s->sdc2 = sdc2_sdhci;
+        sbd2 = SYS_BUS_DEVICE(sdc2_sdhci);
         sysbus_realize_and_unref(sbd2, &error_fatal);
         sysbus_mmio_map(sbd2, 0, MSM8992_SDC2_BASE);
-        msm8992_sdhci_polled(s->sdc2);
+        msm8992_sdhci_polled(sdc2_sdhci);
 
         sdcc2 = qdev_new("msm8992-sdcc");
         sdcc2_sbd = SYS_BUS_DEVICE(sdcc2);
         sysbus_realize_and_unref(sdcc2_sbd, &error_fatal);
-        sysbus_mmio_map(sdcc2_sbd, 0, MSM8992_SDC2_CONF + 0x50);
-        sysbus_mmio_map(sdcc2_sbd, 1, MSM8992_SDC2_CONF + 0x78);
-        sysbus_mmio_map(sdcc2_sbd, 2, MSM8992_SDC2_CONF + 0xDC);
-        sysbus_mmio_map(sdcc2_sbd, 3, MSM8992_SDC2_CONF + 0xE0);
-        sysbus_mmio_map(sdcc2_sbd, 4, MSM8992_SDC2_CONF + 0xE4);
-        sysbus_mmio_map(sdcc2_sbd, 5, MSM8992_SDC2_CONF + 0xE8);
-        sysbus_mmio_map(sdcc2_sbd, 6, MSM8992_SDC2_BASE + 0x100);
+        /* core regs are regions 1..6; region 0 is the unused container */
+        sysbus_mmio_map(sdcc2_sbd, 1, MSM8992_SDC2_CONF + 0x50);
+        sysbus_mmio_map(sdcc2_sbd, 2, MSM8992_SDC2_CONF + 0x78);
+        sysbus_mmio_map(sdcc2_sbd, 3, MSM8992_SDC2_CONF + 0xDC);
+        sysbus_mmio_map(sdcc2_sbd, 4, MSM8992_SDC2_CONF + 0xE0);
+        sysbus_mmio_map(sdcc2_sbd, 5, MSM8992_SDC2_CONF + 0xE4);
+        sysbus_mmio_map(sdcc2_sbd, 6, MSM8992_SDC2_CONF + 0xE8);
 
         {
             DeviceState *orgate = qdev_new(TYPE_OR_IRQ);
@@ -906,7 +934,7 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
             qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(dinfo),
                                     &error_fatal);
             if (!qdev_realize(DEVICE(card),
-                              BUS(qdev_get_child_bus(s->sdc2, "sd-bus")),
+                              BUS(qdev_get_child_bus(sdc2_sdhci, "sd-bus")),
                               &error_fatal))
                 g_assert_not_reached();
         }
