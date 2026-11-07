@@ -110,7 +110,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992SdccState, MSM8992_SDCC)
 #define SDHCI_VENDOR_SIZE  0xC00
 
 /* Bound the debug log: the guest touches these registers a lot. */
-#define SDCC_TRACE_MAX 256
+#define SDCC_TRACE_MAX 40000
 
 struct Msm8992SdccState {
     SysBusDevice parent_obj;
@@ -193,6 +193,9 @@ static uint64_t msm8992_sdcc_vendor_read(void *opaque, hwaddr offset,
     }
 
     uint32_t reg_offset = offset + SDHCI_VENDOR_BASE;
+    msm8992_sdcc_trace(s, "vendor read 0x%x = 0x%x\n",
+                        (unsigned)reg_offset,
+                        (unsigned)s->vendor_regs[offset / 4]);
 
     /* Handle special registers that need specific behavior */
     switch (reg_offset) {
@@ -391,10 +394,19 @@ static void msm8992_sdcc_realize(DeviceState *dev, Error **errp)
 
     /* Initialize the embedded generic-sdhci child (aspeed_sdhci pattern) */
     object_initialize_child(OBJECT(dev), "sdhci", &s->sdhci, TYPE_SYSBUS_SDHCI);
-    object_property_set_int(OBJECT(&s->sdhci), "sd-spec-version", 2, errp);
+    object_property_set_int(OBJECT(&s->sdhci), "sd-spec-version", 3, errp);
     if (*errp) {
         return;
     }
+    /*
+     * SDHCI v3 capabilities: the stock winload probes the high caps
+     * dword (offset 0x44) of every controller while scanning for the
+     * boot device and waits until it reads a nonzero value - the real
+     * 8994 controller is SDHCI v3 with SDR50/SDR104/DDR50 support, so
+     * report the same (BUS_SPEED=1 SDR25? keep 3=SDR104, driver type A,
+     * retuning timer 0xF). */
+    object_property_set_uint(OBJECT(&s->sdhci), "capareg",
+                             0x3f070000057834b4ULL, &error_abort);
 
     /* Realize the embedded SDHCI (aspeed_sdhci pattern) */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sdhci), errp)) {

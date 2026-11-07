@@ -860,6 +860,33 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
     }
     create_unimplemented_device("sdhc2-vendor-cfg", 0xF98A4000ULL, 0x900);
 
+    /*
+     * SDC3 and SDC4: the stock winload scans the register tables of ALL
+     * four SD controllers (0xf982/0xf986/0xf98a/0xf98e) while looking for
+     * the boot device.  Map the same msm8992-sdcc container for them
+     * (core regs + SDHCI, no cards, no IRQs) so the scan sees v3 caps
+     * instead of taking an external abort on an unmapped window. */
+    {
+        static const struct { hwaddr core, sdhci; } extra_sdc[] = {
+            { 0xF9864000ULL, 0xF9864900ULL },   /* SDC3 */
+            { 0xF98E4000ULL, 0xF98E4900ULL },   /* SDC4 */
+        };
+
+        for (size_t i = 0; i < ARRAY_SIZE(extra_sdc); i++) {
+            DeviceState *c = qdev_new("msm8992-sdcc");
+            SysBusDevice *cb = SYS_BUS_DEVICE(c);
+
+            sysbus_realize_and_unref(cb, &error_fatal);
+            sysbus_mmio_map(cb, 0, extra_sdc[i].sdhci);
+            sysbus_mmio_map(cb, 1, extra_sdc[i].core + 0x50);
+            sysbus_mmio_map(cb, 2, extra_sdc[i].core + 0x78);
+            sysbus_mmio_map(cb, 3, extra_sdc[i].core + 0xDC);
+            sysbus_mmio_map(cb, 4, extra_sdc[i].core + 0xE0);
+            sysbus_mmio_map(cb, 5, extra_sdc[i].core + 0xE4);
+            sysbus_mmio_map(cb, 6, extra_sdc[i].core + 0xE8);
+        }
+    }
+
     /* SDC1 endpoint is the on-board eMMC */
     {
         DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
