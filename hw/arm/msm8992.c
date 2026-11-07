@@ -735,6 +735,42 @@ static void msm8992_sdhci_polled(DeviceState *dev)
     (void)dev;
 }
 
+
+/*
+ * RPMB seed for the eMMC: the stock firmware's NSS stack reads its
+ * "security config" record from the RPMB partition (a {u32 version,
+ * u8 flags} blob the factory provisions).  Our eMMC image is a plain
+ * user-area dump with no RPMB region, so the read lands in the GPT and
+ * the version check fails (0x80000019) - the firmware then reports
+ * "Force secure FFU enabled" and bootmgfw enforces production-policy
+ * signature verification of winload.efi (0xc0000428).
+ *
+ * The seed carries version 1 and an all-zero flags byte: "device
+ * provisioned as a test unit, nothing enforced" - the lenient state the
+ * engineering firmware expects. */
+static const char *msm8992_rpmb_seed_file(void)
+{
+    static char path[256];
+    static uint8_t seed[4096];
+
+    if (path[0] == '\0') {
+        const char *tmp = g_get_tmp_dir();
+        FILE *f;
+
+        stl_le_p(seed, 1);              /* record version 1 */
+        /* flags stay zero: no simlock, no production-done, nothing */
+        snprintf(path, sizeof(path), "%s/msm8992-rpmb-seed.bin", tmp);
+        f = fopen(path, "wb");
+        if (f != NULL) {
+            fwrite(seed, 1, sizeof(seed), f);
+            fclose(f);
+        } else {
+            path[0] = '\0';
+        }
+    }
+    return path[0] ? path : NULL;
+}
+
 static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
                                 bool fullchain)
 {
@@ -836,6 +872,8 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
              */
             DeviceState *card = qdev_new(TYPE_EMMC);
 
+            qdev_prop_set_string(card, "rpmb-seed-file",
+                                 msm8992_rpmb_seed_file());
             qdev_prop_set_drive_err(card, "drive",
                                     blk_by_legacy_dinfo(dinfo),
                                     &error_fatal);
@@ -866,6 +904,8 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
                                BDRV_O_RDWR | BDRV_O_SNAPSHOT, &error_fatal);
 
             card2 = qdev_new(TYPE_EMMC);
+            qdev_prop_set_string(card2, "rpmb-seed-file",
+                                 msm8992_rpmb_seed_file());
             qdev_prop_set_drive_err(card2, "drive", be, &error_fatal);
             if (!qdev_realize(DEVICE(card2),
                               BUS(qdev_get_child_bus(msm8992_sdbus_owner(sdc1_host), "sd-bus")),
@@ -876,6 +916,8 @@ static void msm8992_create_sdc1(Msm8992MachineState *s, qemu_irq *gic_spi,
                 /* the card of the legacy MCI the retail SBL1 uses */
                 DeviceState *card = qdev_new(TYPE_EMMC);
 
+                qdev_prop_set_string(card, "rpmb-seed-file",
+                                     msm8992_rpmb_seed_file());
                 qdev_prop_set_drive_err(card, "drive",
                                         blk_by_legacy_dinfo(dinfo),
                                         &error_fatal);

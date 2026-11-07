@@ -202,6 +202,19 @@ struct SDState {
         uint8_t key_set;
         RPMBDataFrame result;
     } rpmb;
+    /*
+     * Machine-provided RPMB seed (hw "rpmb-seed-file"): when the board
+     * model hands us a seed image, the RPMB partition is served from RAM
+     * instead of the backing file.  This is how the msm8992 machine plants
+     * the NSS "security config" record the stock firmware reads at boot
+     * (the real device has it provisioned into RPMB at the factory; our
+     * image is a plain user-area dump with no RPMB region, so reads would
+     * otherwise land in the GPT, fail the record version check
+     * (0x80000019) and force-enable the secure-FFU policy that makes
+     * bootmgfw reject winload.efi with 0xc0000428). */
+    uint8_t *rpmb_seed;
+    uint32_t rpmb_seed_len;
+    char *rpmb_seed_file;
     QEMUTimer *ocr_power_timer;
     uint8_t dat_lines;
     bool cmd_line;
@@ -1212,6 +1225,23 @@ static void emmc_rpmb_blk_read(SDState *sd, uint64_t addr, uint32_t len)
             curr_block += lduw_be_p(&sd->rpmb.result.block_count);
             curr_block -= sd->multi_blk_cnt;
         }
+        if (sd->rpmb_seed != NULL) {
+            /* Seeded RPMB: serve the machine-provided record image. */
+            uint32_t off = curr_block * RPMB_DATA_LEN;
+            uint32_t n = RPMB_DATA_LEN;
+
+            memset(sd->rpmb.result.data, 0, RPMB_DATA_LEN);
+            if (off < sd->rpmb_seed_len) {
+                if (n > sd->rpmb_seed_len - off) {
+                    n = sd->rpmb_seed_len - off;
+                }
+                memcpy(sd->rpmb.result.data, sd->rpmb_seed + off, n);
+            }
+            qemu_log_mask(LOG_UNIMP, "rpmb-seed: block %u -> %02x %02x %02x %02x\n",
+                          curr_block, sd->rpmb.result.data[0],
+                          sd->rpmb.result.data[1], sd->rpmb.result.data[2],
+                          sd->rpmb.result.data[3]);
+        } else {
         addr = curr_block * RPMB_DATA_LEN + sd_part_offset(sd);
         if (blk_pread(sd->blk, addr, RPMB_DATA_LEN,
                       sd->rpmb.result.data, 0) < 0) {
@@ -1221,14 +1251,15 @@ static void emmc_rpmb_blk_read(SDState *sd, uint64_t addr, uint32_t len)
                      RPMB_RESULT_READ_FAILURE
                      | (result & RPMB_RESULT_COUTER_EXPIRED));
         }
-        if (sd->multi_blk_cnt == 1 &&
+        }
+        if (!sd->rpmb_seed && sd->multi_blk_cnt == 1 &&
             !rpmb_calc_hmac(sd, &sd->rpmb.result,
                             lduw_be_p(&sd->rpmb.result.block_count),
                             sd->rpmb.result.key_mac)) {
             memset(sd->rpmb.result.data, 0, sizeof(sd->rpmb.result.data));
             stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_AUTH_FAILURE);
         }
-    } else if (!rpmb_calc_hmac(sd, &sd->rpmb.result, 1,
+    } else if (!sd->rpmb_seed && !rpmb_calc_hmac(sd, &sd->rpmb.result, 1,
                                sd->rpmb.result.key_mac)) {
         memset(sd->rpmb.result.data, 0, sizeof(sd->rpmb.result.data));
         stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_AUTH_FAILURE);
@@ -1254,7 +1285,8 @@ static void emmc_rpmb_blk_write(SDState *sd, uint64_t addr, uint32_t len)
     stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_OK);
     stw_be_p(&sd->rpmb.result.req_resp, RPMB_RESP(req));
 
-    if (!sd->rpmb.key_set && req != RPMB_REQ_PROGRAM_AUTH_KEY) {
+    if (!sd->rpmb.key_set && !sd->rpmb_seed &&
+        req != RPMB_REQ_PROGRAM_AUTH_KEY) {
         stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_NO_AUTH_KEY);
         goto exit;
     }
@@ -1273,7 +1305,7 @@ static void emmc_rpmb_blk_write(SDState *sd, uint64_t addr, uint32_t len)
         break;
     case RPMB_REQ_AUTH_DATA_WRITE:
         /* We only support single-block writes so far */
-        if (sd->multi_blk_cnt != 1) {
+        if (sd->multi_blk_cnt != 1 && !sd->rpmb_seed) {
             stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_GENERAL_FAILURE);
             break;
         }
@@ -1291,6 +1323,13 @@ static void emmc_rpmb_blk_write(SDState *sd, uint64_t addr, uint32_t len)
             break;
         }
         sd->rpmb.result.address = frame->address;
+        if (sd->rpmb_seed != NULL) {
+            /* Seeded RPMB: the record image is read-only for the guest;
+             * accept the write so provisioning flows stay happy. */
+            sd->rpmb.write_counter++;
+            stl_be_p(&sd->rpmb.result.write_counter, sd->rpmb.write_counter);
+            break;
+        }
         addr = lduw_be_p(&frame->address) * RPMB_DATA_LEN + sd_part_offset(sd);
         if (blk_pwrite(sd->blk, addr, RPMB_DATA_LEN, frame->data, 0) < 0) {
             error_report("sd_blk_write: write error on host side");
@@ -1434,7 +1473,8 @@ static void emmc_function_switch(SDState *sd, uint32_t arg)
 
         if (((part == EXT_CSD_PART_CONFIG_ACC_BOOT1 ||
               part == EXT_CSD_PART_CONFIG_ACC_BOOT2) && !sd->boot_part_size) ||
-            (part == EXT_CSD_PART_CONFIG_ACC_RPMB && !sd->rpmb_part_size)) {
+            (part == EXT_CSD_PART_CONFIG_ACC_RPMB && !sd->rpmb_part_size &&
+             !sd->rpmb_seed)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "MMC switching to illegal partition\n");
             sd->card_status |= R_CSR_SWITCH_ERROR_MASK;
@@ -3102,6 +3142,20 @@ static void sd_realize(DeviceState *dev, Error **errp)
     SDState *sd = SDMMC_COMMON(dev);
     int ret;
 
+    if (sd->rpmb_seed_file != NULL) {
+        gsize len;
+        GError *gerr = NULL;
+
+        if (!g_file_get_contents(sd->rpmb_seed_file, (gchar **)&sd->rpmb_seed,
+                                 &len, &gerr)) {
+            error_setg(errp, "rpmb-seed-file: %s",
+                       gerr ? gerr->message : "read failed");
+            g_error_free(gerr);
+            return;
+        }
+        sd->rpmb_seed_len = (uint32_t)len;
+    }
+
     switch (sd->spec_version) {
     case SD_PHY_SPECv2_00_VERS
      ... SD_PHY_SPECv3_01_VERS:
@@ -3216,6 +3270,7 @@ static const Property emmc_properties[] = {
     DEFINE_PROP_UINT64("boot-partition-size", SDState, boot_part_size, 0),
     DEFINE_PROP_UINT8("boot-config", SDState, boot_config, 0x0),
     DEFINE_PROP_UINT64("rpmb-partition-size", SDState, rpmb_part_size, 0),
+    DEFINE_PROP_STRING("rpmb-seed-file", SDState, rpmb_seed_file),
     DEFINE_PROP_STRING("auth-key", SDState, preset_auth_key),
 };
 
