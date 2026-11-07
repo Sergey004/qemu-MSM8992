@@ -78,6 +78,7 @@ struct QCTQtimerState {
     uint32_t secure;
     QCTHextimerState timer[QCT_QTIMER_TIMER_FRAME_ELTS];
     uint32_t freq_hz;
+    uint32_t ac_pad[64];    /* unmodelled AC words (0x00..0xff) */
     uint32_t nr_frames;
     uint32_t nr_views;
     uint32_t frame_stride;
@@ -196,6 +197,13 @@ static uint64_t qct_qtimer_ac_read(void *opaque, hwaddr offset, unsigned size)
     case QCT_QTIMER_VERSION:
         return QCT_QTIMER_VERSION_VALUE;
     default:
+        if (offset < 0x100) {
+            /* The W10M QcTimerBspLib pokes AC words we don't model
+             * (0x0c..0x3f) - return the latched value instead of
+             * erroring: the kernel's timer bring-up stalls on an
+             * erroring read. */
+            return s->ac_pad[offset >> 2];
+        }
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%x\n", __func__,
                       (int)offset);
         return 0;
@@ -208,6 +216,14 @@ static void qct_qtimer_ac_write(void *opaque, hwaddr offset, uint64_t value,
     QCTQtimerState *s = opaque;
     uint32_t frame;
 
+    if (offset < 0x100 &&
+        offset != QCT_QTIMER_AC_CNTFRQ && offset != QCT_QTIMER_AC_CNTSR &&
+        offset != QCT_QTIMER_AC_CNTTID_0 &&
+        (offset < QCT_QTIMER_AC_CNTACR_START ||
+         offset > QCT_QTIMER_AC_CNTACR_END)) {
+        s->ac_pad[offset >> 2] = value;
+        return;
+    }
     switch (offset) {
     case QCT_QTIMER_AC_CNTFRQ:
         if (value == 0) {
@@ -369,10 +385,11 @@ static MemTxResult hex_timer_read(void *opaque, hwaddr offset, uint64_t *data,
         *data = (uint32_t)(int32_t)(int64_t)(s->cntval - hex_timer_now(s));
         return MEMTX_OK;
     case QCT_QTIMER_CNTP_CTL:
+    case 0x3c:
         /*
          * CNTP_CTL: bit 0 EN, bit 1 IMASK, bit 2 ISTAT (interrupt
-         * pending). ISTAT tracks int_level and is read-only.
-         */
+         * pending). ISTAT tracks int_level and is read-only.  0x3c is
+         * the W10M alias of the control register (see the write path). */
         *data = s->control | ((s->int_level & 0x1) << 2);
         return MEMTX_OK;
     case QCT_QTIMER_CNTPL0ACR:
@@ -428,7 +445,12 @@ static MemTxResult hex_timer_write(void *opaque, hwaddr offset,
         hex_timer_rearm(s);
         break;
     case QCT_QTIMER_CNTP_CTL:
-        /* ISTAT (bit 2) is read-only; keep SW writes from polluting it. */
+    case 0x3c:
+        /*
+         * 0x3c: the W10M QcTimerBspLib writes the frame enable here
+         * (its register layout places a second/aliased CNTP_CTL at
+         * 0x3c); treat it as CNTP_CTL - without it the frame never
+         * starts and the kernel waits for its tick forever. */
         s->control = value & ~QCT_QTIMER_CNTP_CTL_ISTAT;
         hex_timer_rearm(s);
         break;
@@ -445,9 +467,10 @@ static MemTxResult hex_timer_write(void *opaque, hwaddr offset,
         }
         break;
     default:
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%x\n", __func__,
-                      (int)offset);
-        return MEMTX_ACCESS_ERROR;
+        qemu_log_mask(LOG_UNIMP,
+                      "qtimer frame wr 0x%x = 0x%llx (UNMODELLED)\n",
+                      (int)reg_offset, (unsigned long long)value);
+        return MEMTX_OK;
     }
     hex_timer_update(s);
     return MEMTX_OK;

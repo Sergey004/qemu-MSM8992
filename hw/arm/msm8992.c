@@ -96,7 +96,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MachineState, MSM8992_MACHINE)
 
 #define MSM8992_GIC_DIST    0xF9000000ULL
 #define MSM8992_GIC_CPU     0xF9002000ULL
-#define MSM8992_GIC_NUM_SPI 256                 /* qgic2: 256 SPI + 32 = 288 */
+#define MSM8992_GIC_NUM_SPI 960                 /* qgic2: 960 SPI + 32 = 992 */
 
 #define MSM8992_QTIMER_F0   0xF9021000ULL       /* armv7-timer-mem frame 0 */
 #define MSM8992_GCC_BASE    0xFC400000ULL       /* qcom,gcc-8992, len 0x2000 */
@@ -126,14 +126,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MachineState, MSM8992_MACHINE)
 
 /* GIC PPI interrupt numbers (banked per-CPU) */
 /*
- * ARM generic timer PPIs (the DT binding the Linux kernel expects:
- * <GIC_PPI 14> secure physical, <GIC_PPI 10> non-secure physical,
- * <GIC_PPI 13> virtual, <GIC_PPI 11> hypervisor).
- */
-#define MSM8992_PHYS_TIMER_PPI  10   /* non-secure physical (CNTPCT) */
-#define MSM8992_VIRT_TIMER_PPI  13   /* virtual (CNTVCT) */
-#define MSM8992_HYP_TIMER_PPI   11   /* hypervisor */
-#define MSM8992_SEC_TIMER_PPI   14   /* secure physical (CNTP_CT) */
+ * The arch timer PPIs are NOT the ARM-standard ones on this platform:
+ * the phone's own GTDT (ACPI table of the retail image) describes
+ * NS-EL1 timer GSIV 19, EL2 GSIV 20, virtual GSIV 17 - Qualcomm wired
+ * the timer PPIs to INTID 17/19/20.  The W10M kernel (ACPI boot)
+ * programs CNTP and unmasks GSIV 19; with the arch timer wired to the
+ * standard PPIs (29/30) the interrupt lands on an unmasked line and
+ * the kernel sits in WFI forever right after its early boot.
+ * (The GTDT also lists one platform timer: the QTIMER frame at
+ * 0xF9020000 - modelled separately.) */
+#define MSM8992_PHYS_TIMER_PPI  3    /* NS-EL1 timer, GSIV 19 */
+#define MSM8992_VIRT_TIMER_PPI  1    /* virtual timer, GSIV 17 */
+#define MSM8992_HYP_TIMER_PPI   4    /* EL2 timer, GSIV 20 */
+#define MSM8992_SEC_TIMER_PPI   14   /* S-EL1: absent in GTDT, unused */
 #define GIC_MAINTENANCE_PPI     9
 
 struct Msm8992MachineState {
@@ -190,7 +195,14 @@ static void msm8992_create_cpus(Msm8992MachineState *s, MachineState *ms)
 
         object_initialize_child(parent, "cpu[*]", &s->cpu[i], type);
 
-        if (i != MSM8992_BOOT_CPU && false) {
+        /*
+         * Secondaries must start POWERED OFF (halted): the kernel boots
+         * them through PSCI CPU_ON, and QEMU's PSCI rejects CPU_ON for a
+         * CPU that is already running (ALREADY_ON).  With the old
+         * runnable wfi-stub park the kernel's secondaries never came up
+         * and the primary sat in WFI waiting for their online flags
+         * forever. */
+        if (i != MSM8992_BOOT_CPU) {
             object_property_set_bool(OBJECT(&s->cpu[i]),
                                      "start-powered-off", true, &error_abort);
         }
@@ -1256,6 +1268,9 @@ static void msm8992_create_stubs(MachineState *ms, qemu_irq *gic_spi,
         DeviceState *fb;
         fb = qdev_new("msm8992-fb");
         sysbus_realize_and_unref(SYS_BUS_DEVICE(fb), &error_fatal);
+        /* MDP5 register window (the fb device captures SSPP writes for
+         * live scanout) — replaces the old unimplemented mdp5 stub */
+        sysbus_mmio_map(SYS_BUS_DEVICE(fb), 0, MSM8992_MDP5_BASE);
     }
 
     /* Tier-2/3 placeholders */
@@ -1268,7 +1283,6 @@ static void msm8992_create_stubs(MachineState *ms, qemu_irq *gic_spi,
     create_unimplemented_device("bimc",      0xFC000000ULL, 0x400000);
     create_unimplemented_device("vbif",      0xFD8C0000ULL, 0x40000);
     create_unimplemented_device("kgsl-3d0",  MSM8992_KGSL_BASE, 0x10000);
-    create_unimplemented_device("mdp5",      MSM8992_MDP5_BASE, 0xB4000);
     create_unimplemented_device("smmu-mmu0", MSM8992_SMMU_MMU0, 0xB000);
     create_unimplemented_device("ocmem",     MSM8992_OCMEM_BASE, 0x2000);
     create_unimplemented_device("dwc3",      MSM8992_DWC3_BASE, 0xFC000);
