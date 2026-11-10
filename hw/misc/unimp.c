@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/cpu.h"
 #include "hw/misc/unimp.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -38,14 +39,27 @@ static bool unimp_page_logged(UnimplementedDeviceState *s, hwaddr offset)
     return true;
 }
 
+/* Bring-up aid: include the faulting guest PC in unimplemented-access logs. */
+static void unimp_log_pc(void)
+{
+    CPUState *cpu = current_cpu;
+
+    if (cpu && cpu->cc && cpu->cc->get_pc) {
+        qemu_log(" guest_pc=0x%0*" PRIx64,
+                 (int)sizeof(vaddr) * 2, cpu->cc->get_pc(cpu));
+    }
+}
+
 static uint64_t unimp_read(void *opaque, hwaddr offset, unsigned size)
 {
     UnimplementedDeviceState *s = UNIMPLEMENTED_DEVICE(opaque);
 
     if (unimp_page_logged(s, offset)) {
         qemu_log_mask(LOG_UNIMP, "%s: unimplemented device read  "
-                      "(size %d, offset 0x%0*" HWADDR_PRIx ")\n",
+                      "(size %d, offset 0x%0*" HWADDR_PRIx ")",
                       s->name, size, s->offset_fmt_width, offset);
+        unimp_log_pc();
+        qemu_log("\n");
     }
     return 0;
 }
@@ -58,9 +72,11 @@ static void unimp_write(void *opaque, hwaddr offset,
     if (unimp_page_logged(s, offset)) {
         qemu_log_mask(LOG_UNIMP, "%s: unimplemented device write "
                       "(size %d, offset 0x%0*" HWADDR_PRIx
-                      ", value 0x%0*" PRIx64 ")\n",
+                      ", value 0x%0*" PRIx64 ")",
                       s->name, size, s->offset_fmt_width, offset, size << 1,
                       value);
+        unimp_log_pc();
+        qemu_log("\n");
     }
 }
 

@@ -213,6 +213,12 @@ config MSM8992_PCIE
 config MSM8992_QUP
     bool
 
+config MSM8992_TRACE_MMIO
+    bool
+
+config MSM8992_GICV2M
+    bool
+
 config UNIMP
     bool
 

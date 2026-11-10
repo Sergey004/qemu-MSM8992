@@ -36,6 +36,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/usb/hcd-dwc3.h"
 #include "qapi/error.h"
+#include "qemu/log.h"
 
 #ifndef USB_DWC3_ERR_DEBUG
 #define USB_DWC3_ERR_DEBUG 0
@@ -398,6 +399,77 @@ static void usb_dwc3_guid_postw(RegisterInfo *reg, uint64_t val64)
     s->regs[R_GUID] = s->cfg.dwc_usb3_user;
 }
 
+static void usb_dwc3_gusb2phyacc_ulpi_postw(RegisterInfo *reg, uint64_t val64)
+{
+    USBDWC3 *s = USB_DWC3(reg->opaque);
+    uint32_t val = (uint32_t)val64;
+    
+    /* Extract fields from GUSB2PHYACC_ULPI */
+    uint32_t regaddr = (val >> 16) & 0x3F;        /* bits 16-21: 6 bits (REGADDR) */
+    uint32_t extregaddr = (val >> 8) & 0xFF;      /* bits 8-15: 8 bits (EXTREGADDR) */
+    uint32_t regdata = val & 0xFF;                /* bits 0-7: 8 bits (REGDATA) */
+    uint32_t regwr = (val >> 22) & 0x1;           /* bit 22: write=1, read=0 (REGWR) */
+    uint32_t newregrq = (val >> 25) & 0x1;        /* bit 25: new register request (NEWREGREQ) */
+    uint32_t vstbsy = (val >> 23) & 0x1;          /* bit 23: vendor status busy (VSTSBSY) */
+    uint32_t vstsdone = (val >> 24) & 0x1;        /* bit 24: vendor status done (VSTSDONE) */
+    
+    /* Full 8-bit ULPI register address: (EXTREGADDR << 6) | REGADDR */
+    uint32_t addr = (extregaddr << 6) | regaddr;
+    
+    qemu_log("ULPI: post_write called, val=0x%08x, regwr=%u, newregrq=%u, extregaddr=0x%02x, regaddr=0x%02x, addr=0x%02x, regdata=0x%02x, vstbsy=%u, vstsdone=%u\n",
+             val, regwr, newregrq, extregaddr, regaddr, addr, regdata, vstbsy, vstsdone);
+    
+    /* ALWAYS log any write attempt to this register */
+    if (val != 0) {
+        qemu_log("ULPI: NON-ZERO WRITE to GUSB2PHYACC_ULPI!\n");
+    }
+    
+    /* Always update ULPI PHY registers if regwr is set and we have meaningful data */
+    if (regwr && (regdata != 0 || extregaddr != 0 || regaddr != 0)) {
+        if (addr < 256) {
+            s->ulpi_phy_regs[addr] = (uint8_t)regdata;
+            qemu_log("ULPI: WRITE addr=0x%02x data=0x%02x (regwr=%u, newregrq=%u)\n", addr, regdata, regwr, newregrq);
+        }
+    }
+    
+    /* If NEWREGREQ is set, perform the ULPI register access and complete it */
+    if (newregrq) {
+        if (!regwr) {
+            /* Read operation: kernel reads from ULPI PHY register */
+            if (addr < 256) {
+                val = (val & ~0xFF) | s->ulpi_phy_regs[addr];
+                qemu_log("ULPI: READ addr=0x%02x data=0x%02x\n", addr, s->ulpi_phy_regs[addr]);
+            }
+        }
+        
+        /* Mark operation complete: clear NEWREGREQ, set VSTSDONE=1, VSTSBSY=0 */
+        val &= ~(1u << 25);  /* clear NEWREGREQ */
+        val |= (1u << 24);   /* VSTSDONE */
+        val &= ~(1u << 23);  /* VSTSBSY */
+    }
+    
+    /* Even without NEWREGREQ, if the kernel is writing a command, set VSTSDONE to ack it */
+    if (regwr && (extregaddr != 0 || regaddr != 0) && !newregrq) {
+        /* Kernel might be polling without NEWREGREQ - ack the write */
+        val |= (1u << 24);   /* VSTSDONE */
+        val &= ~(1u << 23);  /* VSTSBSY */
+        qemu_log("ULPI: Setting VSTSDONE for write without NEWREGREQ\n");
+    }
+    
+    s->regs[R_GUSB2PHYACC_ULPI] = val;
+}
+
+/* Trace reads to see what's happening */
+static uint64_t usb_dwc3_gusb2phyacc_ulpi_postr(RegisterInfo *reg, uint64_t val64)
+{
+    USBDWC3 *s = USB_DWC3(reg->opaque);
+    uint32_t val = (uint32_t)val64;
+    
+    qemu_log("ULPI: post_read called, val=0x%08x\n", val);
+    (void)s;  /* unused */
+    return val64;
+}
+
 static const RegisterAccessInfo usb_dwc3_regs_info[] = {
     {   .name = "GSBUSCFG0",  .addr = A_GSBUSCFG0,
         .ro = 0xf300,
@@ -474,8 +546,10 @@ static const RegisterAccessInfo usb_dwc3_regs_info[] = {
         .ro = 0xffffffff,
         .unimp = 0xffffffff,
     },{ .name = "GUSB2PHYACC_ULPI",  .addr = A_GUSB2PHYACC_ULPI,
-        .ro = 0xfd000000,
-        .unimp = 0xffffffff,
+        .ro = 0x00000000,
+        .unimp = 0x00000000,
+        .post_write = usb_dwc3_gusb2phyacc_ulpi_postw,
+        .post_read = usb_dwc3_gusb2phyacc_ulpi_postr,
     },{ .name = "GTXFIFOSIZ0",  .addr = A_GTXFIFOSIZ0,
         .reset = 0x2c7000a,
         .unimp = 0xffffffff,
@@ -625,6 +699,45 @@ static void usb_dwc3_realize(DeviceState *dev, Error **errp)
     s->regs[R_GHWPARAMS6] = 0x7850c20;
     s->regs[R_GHWPARAMS7] = 0x0;
     s->regs[R_GHWPARAMS8] = 0x478;
+
+    /* Initialize ULPI PHY registers with default values */
+    memset(s->ulpi_phy_regs, 0, sizeof(s->ulpi_phy_regs));
+    /* Vendor ID: 0x0424 (Microchip/SMSC - common for ULPI PHYs like USB3320/USB3340) */
+    s->ulpi_phy_regs[0x00] = 0x24;  /* Vendor ID Low */
+    s->ulpi_phy_regs[0x01] = 0x04;  /* Vendor ID High */
+    /* Product ID: 0x2774 (USB3320/USB3340 typical) */
+    s->ulpi_phy_regs[0x02] = 0x74;  /* Product ID Low */
+    s->ulpi_phy_regs[0x03] = 0x27;  /* Product ID High */
+    /* Function Control (0x04): High-Speed transceiver, normal opmode */
+    s->ulpi_phy_regs[0x04] = 0x04;  /* Function Control: HS transceiver */
+    s->ulpi_phy_regs[0x05] = 0x00;  /* Function Control Set */
+    s->ulpi_phy_regs[0x06] = 0x00;  /* Function Control Clear */
+    /* Interface Control (0x07) */
+    s->ulpi_phy_regs[0x07] = 0x00;  /* Interface Control */
+    s->ulpi_phy_regs[0x08] = 0x00;  /* Interface Control Set */
+    s->ulpi_phy_regs[0x09] = 0x00;  /* Interface Control Clear */
+    /* OTG Control (0x0A) */
+    s->ulpi_phy_regs[0x0A] = 0x00;  /* OTG Control */
+    s->ulpi_phy_regs[0x0B] = 0x00;  /* OTG Control Set */
+    s->ulpi_phy_regs[0x0C] = 0x00;  /* OTG Control Clear */
+    /* USB Interrupt Enable Rising (0x0D) */
+    s->ulpi_phy_regs[0x0D] = 0x00;
+    s->ulpi_phy_regs[0x0E] = 0x00;
+    s->ulpi_phy_regs[0x0F] = 0x00;
+    /* USB Interrupt Enable Falling (0x10) */
+    s->ulpi_phy_regs[0x10] = 0x00;
+    s->ulpi_phy_regs[0x11] = 0x00;
+    s->ulpi_phy_regs[0x12] = 0x00;
+    /* USB Interrupt Status (0x13) - read only */
+    s->ulpi_phy_regs[0x13] = 0x00;
+    /* USB Interrupt Latch (0x14) - read only */
+    s->ulpi_phy_regs[0x14] = 0x00;
+    /* Debug (0x15) - read only */
+    s->ulpi_phy_regs[0x15] = 0x00;
+    /* Scratch Register (0x16-0x18) */
+    s->ulpi_phy_regs[0x16] = 0x00;
+    s->ulpi_phy_regs[0x17] = 0x00;
+    s->ulpi_phy_regs[0x18] = 0x00;
 }
 
 static void usb_dwc3_init(Object *obj)

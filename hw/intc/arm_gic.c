@@ -58,7 +58,9 @@ static const uint8_t gic_id_gicv2[] = {
 
 static inline int gic_get_current_cpu(GICState *s)
 {
-    if (!qtest_enabled() && s->num_cpu > 1) {
+    /* current_cpu is NULL when accessed from the main thread (HMP `xp`,
+     * qtest-less property resets) — read CPU0's bank instead of faulting. */
+    if (!qtest_enabled() && s->num_cpu > 1 && current_cpu != NULL) {
         return current_cpu->cpu_index - s->first_cpu_index;
     }
     return 0;

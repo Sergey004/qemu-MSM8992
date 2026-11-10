@@ -190,3 +190,5 @@ system_ss.add(when: 'CONFIG_MSM8992_TCSR', if_true: files('msm8992-tcsr.c'))
 
 system_ss.add(when: 'CONFIG_MSM8992_SPMI', if_true: files('msm8992-spmi.c'))
 system_ss.add(when: 'CONFIG_MSM8992_PRNG', if_true: files('msm8992-prng.c'))
+system_ss.add(when: 'CONFIG_MSM8992_TRACE_MMIO', if_true: files('msm8992-trace-mmio.c'))
+system_ss.add(when: 'CONFIG_MSM8992_GICV2M', if_true: files('msm8992-gicv2m.c'))

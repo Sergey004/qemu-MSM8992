@@ -51,6 +51,9 @@ typedef struct USBDWC3 {
         uint32_t    dwc_usb3_user;
     } cfg;
 
+    /* ULPI PHY registers (vendor-specific extended register set 0x80-0xFF) */
+    uint8_t ulpi_phy_regs[256];
+
 } USBDWC3;
 
 #endif

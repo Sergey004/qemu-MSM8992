@@ -54,6 +54,7 @@
 #include "hw/char/serial-mm.h"
 #include "chardev/char.h"
 #include "hw/timer/qct-qtimer.h"
+#include "hw/usb/hcd-dwc3.h"
 #include "target/arm/cpu-qom.h"
 #include "target/arm/cpu.h"
 #include "target/arm/gtimer.h"
@@ -1285,7 +1286,49 @@ static void msm8992_create_stubs(MachineState *ms, qemu_irq *gic_spi,
     create_unimplemented_device("kgsl-3d0",  MSM8992_KGSL_BASE, 0x10000);
     create_unimplemented_device("smmu-mmu0", MSM8992_SMMU_MMU0, 0xB000);
     create_unimplemented_device("ocmem",     MSM8992_OCMEM_BASE, 0x2000);
-    create_unimplemented_device("dwc3",      MSM8992_DWC3_BASE, 0xFC000);
+    {
+        DeviceState *dwc3;
+        dwc3 = qdev_new(TYPE_USB_DWC3);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dwc3), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dwc3), 0, MSM8992_DWC3_BASE);
+        /* Connect XHCI sysbus IRQ (the DWC3 contains an XHCI sysbus child) */
+        Object *xhci_obj = object_resolve_path_component(OBJECT(dwc3), "dwc3-xhci");
+        if (xhci_obj) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(xhci_obj), 0, gic_spi[138]); /* INTID 170 */
+        }
+    }
+    /*
+     * USB30 window tail beyond the DWC3 core registers (dtsi: dwc3 reg is
+     * 0xfc000 at 0xf9200000; the model covers only the first 0x10000).
+     * Contains dbm_1p5@0xf92f8000 and the HS (ULPI) PHY hsphy0@0xf92f8800
+     * (qcom,usb-hsphy core, 0x3ff) — the PHY the Windows kernel drives
+     * through its "UlpiPhyWrite" path.  RAM-backed with dedup tracing.
+     */
+    {
+        DeviceState *tm;
+        tm = qdev_new("msm8992-trace-mmio");
+        qdev_prop_set_string(tm, "name", "usb30-hi");
+        qdev_prop_set_uint64(tm, "size", 0xEC000);
+        qdev_prop_set_uint64(tm, "trace-reads", 1);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(tm), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(tm), 0, 0xF9210000ULL);
+    }
+    create_unimplemented_device("usb-bam",     0xF9304000ULL, 0x9000);
+    create_unimplemented_device("ss-usbotg",   0xF9A40000ULL, 0x16000);
+    create_unimplemented_device("usb-ssphy",   0xF9B38000ULL, 0x800);
+    create_unimplemented_device("usb-hsphy-csr", 0xF9B3A000ULL, 0x200);
+    create_unimplemented_device("usb-ssphy-ahb2phy", 0xF9B3E000ULL, 0x400);
+    /*
+     * GICv2M MSI frame the stock GTDT references (type-0xD platform timer
+     * subtable, base 0xF9007000).  The kernel reads MSI_TYPER (+0x8) during
+     * early init; without it HalInitSystem bugchecks 0x5C/0x110.
+     */
+    {
+        DeviceState *v2m;
+        v2m = qdev_new("msm8992-gicv2m");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(v2m), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(v2m), 0, 0xF9007000ULL);
+    }
     {
         DeviceState *t;
         t = qdev_new("msm8992-tcsr");
@@ -1549,6 +1592,18 @@ static void msm8992_populate_smem(MachineState *ms)
         msm8992_smem_store(base, t + 24, 0x0000000F); /* prop: ctype APPS_RPM */
         msm8992_smem_store(base, t + 28, 1);        /* ref_count */
 
+        /*
+         * SMD channel 26 ("ipc_router_smd"): the W10M HAL's early-init
+         * provider lookup walks the channel table for cid 0x28 and
+         * bugchecks 0x5C (HAL_INITIALIZATION_FAILED, arg 0x110) with
+         * STATUS_DEVICE_FEATURE_NOT_SUPPORTED when it is absent.  Same
+         * APPS<->RPM edge so the same SMD client opens it.
+         */
+        memcpy(base + t + 32 * 26 + 0, "ipc_router_smd", 15);
+        msm8992_smem_store(base, t + 32 * 26 + 20, 26);
+        msm8992_smem_store(base, t + 32 * 26 + 24, 0x0000000F);
+        msm8992_smem_store(base, t + 32 * 26 + 28, 1);
+
         hwaddr c = SMEM_SMD_CTRL_OFF;
         int half;
         for (half = 0; half < 2; half++) {
@@ -1556,6 +1611,12 @@ static void msm8992_populate_smem(MachineState *ms)
             msm8992_smem_store(base, c + half * 44 + 4, 1); /* DTR_DSR */
             msm8992_smem_store(base, c + half * 44 + 8, 1); /* CTS_RTS */
             /* CD/RI/indices stay 0 */
+        }
+        /* channel 26's own ctrl block and fifo window */
+        for (half = 0; half < 2; half++) {
+            msm8992_smem_store(base, c + 26 * 44 + half * 44 + 0, 2);
+            msm8992_smem_store(base, c + 26 * 44 + half * 44 + 4, 1);
+            msm8992_smem_store(base, c + 26 * 44 + half * 44 + 8, 1);
         }
     }
     msm8992_smem_store(base, SMEM32_OFF_ALLOC + SMEM_ITEM_SMD_BASE * 16 + 0, 1);
