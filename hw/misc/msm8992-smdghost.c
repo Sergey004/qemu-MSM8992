@@ -5,7 +5,7 @@
  * Library/RpmLib and Lumia950XLPkg/Driver/SmdRpmDxe/smd.c).
  *
  * Layout (all offsets relative to the SMEM base we prepopulate in msm8992.c):
- *   ctrl @SMEM+0x31000: two halves (APPS ch0 @+0, RPM ch1 @+0x2c), each a
+ *   ctrl @SMEM+0x31000: two halves (APPS ch0 @+0, RPM ch1 @+0x50), each a
  *       smd_shared_stream_info_type { state, DTR_DSR, CTS_RTS, CD, RI,
  *       data_written, data_read, state_updated, mask_recv_intr,
  *       read_index, write_index } = 11 x u32.
@@ -47,6 +47,7 @@ struct Msm8992SmdGhostState {
     qemu_irq     irq;
     uint32_t     last_ch0_wr;
     uint32_t     last_ch0_state;
+    bool         primed;
     bool         irq_asserted;
     uint32_t     last_reply_wr;
     uint64_t     reply_serial;
@@ -90,26 +91,33 @@ static void msm8992_smd_ghost_tick(void *opaque)
     uint32_t ch0_wr = smd_rd32(SMD_GHOST_CTRL_OFF + 0x28);
     uint32_t ch0_rd = smd_rd32(SMD_GHOST_CTRL_OFF + 0x24);
     uint32_t ch0_state = smd_rd32(SMD_GHOST_CTRL_OFF + 0x00);
-    uint32_t ch1_rd = smd_rd32(SMD_GHOST_CTRL_OFF + 0x24 + 0x2c);
-    uint32_t ch1_wr = smd_rd32(SMD_GHOST_CTRL_OFF + 0x28 + 0x2c);
+    uint32_t ch1_rd = smd_rd32(SMD_GHOST_CTRL_OFF + 0x24 + 0x50);
+    uint32_t ch1_wr = smd_rd32(SMD_GHOST_CTRL_OFF + 0x28 + 0x50);
     bool     events = FALSE;
 
     /* SMD state machine: mirror the guest's states onto ch1 like the RPM
      * firmware would.  OPENING->OPENED; CLOSING->CLOSING (the guest's
      * smd_irq_handler does the CLOSED transition itself and then marks the
      * channel freed). */
-    if (ch0_state != s->last_ch0_state) {
+    if (!s->primed && ch0_state == 2) {
+        /* The plant already has both halves OPENED; the guest still needs
+         * one SMD interrupt to notice the channel. */
+        s->primed = TRUE;
+        smd_wr32(SMD_GHOST_CTRL_OFF + 0x50 + 0x1c, 1);  /* state_updated */
+        events = TRUE;
+        qemu_log("smdghost: pre-opened channel, prime irq\n");
+    } else if (ch0_state != s->last_ch0_state) {
         uint32_t prev_ch0_state = s->last_ch0_state;
 
         s->last_ch0_state = ch0_state;
         if (ch0_state == 1) {                       /* OPENING */
-            smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x00, 2);  /* ch1 = OPENED */
-            smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x1c, 1);  /* state_updated */
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x50 + 0x00, 2);  /* ch1 = OPENED */
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x50 + 0x1c, 1);  /* state_updated */
             events = TRUE;
             qemu_log("smdghost: ack OPENING -> OPENED\n");
         } else if (ch0_state == 4) {                /* CLOSING */
-            smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x00, 4);  /* ch1 = CLOSING */
-            smd_wr32(SMD_GHOST_CTRL_OFF + 0x2c + 0x1c, 1);  /* state_updated */
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x50 + 0x00, 4);  /* ch1 = CLOSING */
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x50 + 0x1c, 1);  /* state_updated */
             events = TRUE;
             qemu_log("smdghost: mirror CLOSING on ch1\n");
         } else if (ch0_state == 0 && prev_ch0_state == 4) {
@@ -167,7 +175,7 @@ static void msm8992_smd_ghost_tick(void *opaque)
                                 SMD_GHOST_FIFO_HALF + (ch1_wr % SMD_GHOST_FIFO_HALF),
                                 MEMTXATTRS_UNSPECIFIED, ack, sizeof(ack));
             ch1_wr += 40;                            /* only write_index! */
-            smd_wr32(SMD_GHOST_CTRL_OFF + 0x28 + 0x2c, ch1_wr);
+            smd_wr32(SMD_GHOST_CTRL_OFF + 0x28 + 0x50, ch1_wr);
             events = TRUE;
         }
         smd_wr32(SMD_GHOST_CTRL_OFF + 0x24, ch0_wr);  /* consumed */

@@ -1593,16 +1593,22 @@ static void msm8992_populate_smem(MachineState *ms)
         msm8992_smem_store(base, t + 28, 1);        /* ref_count */
 
         /*
-         * SMD channel 26 ("ipc_router_smd"): the W10M HAL's early-init
-         * provider lookup walks the channel table for cid 0x28 and
+         * SMD channel 26 ("ipc_router_smd") and channel 40: the W10M HAL's
+         * early-init provider lookup walks the channel table for cid 0x28
+         * (=40, inside the [30..63] window its insert path covers) and
          * bugchecks 0x5C (HAL_INITIALIZATION_FAILED, arg 0x110) with
          * STATUS_DEVICE_FEATURE_NOT_SUPPORTED when it is absent.  Same
          * APPS<->RPM edge so the same SMD client opens it.
          */
         memcpy(base + t + 32 * 26 + 0, "ipc_router_smd", 15);
         msm8992_smem_store(base, t + 32 * 26 + 20, 26);
-        msm8992_smem_store(base, t + 32 * 26 + 24, 0x0000000F);
+        msm8992_smem_store(base, t + 32 * 26 + 24, 0x0000020F);
         msm8992_smem_store(base, t + 32 * 26 + 28, 1);
+
+        memcpy(base + t + 32 * 40 + 0, "ipc_router_smd", 15);
+        msm8992_smem_store(base, t + 32 * 40 + 20, 40);
+        msm8992_smem_store(base, t + 32 * 40 + 24, 0x0000020F);
+        msm8992_smem_store(base, t + 32 * 40 + 28, 1);
 
         hwaddr c = SMEM_SMD_CTRL_OFF;
         int half;
@@ -1612,6 +1618,11 @@ static void msm8992_populate_smem(MachineState *ms)
             msm8992_smem_store(base, c + half * 44 + 8, 1); /* CTS_RTS */
             /* CD/RI/indices stay 0 */
         }
+        /* W10M kernel ctrl halves are 0x50 apart (it polls +0x50/+0x54 for
+         * the remote half) - plant half1 there too. */
+        msm8992_smem_store(base, c + 0x50 + 0, 2);  /* remote half OPENED */
+        msm8992_smem_store(base, c + 0x50 + 4, 1);  /* DTR_DSR */
+        msm8992_smem_store(base, c + 0x50 + 8, 1);  /* CTS_RTS */
         /* channel 26's own ctrl block and fifo window */
         for (half = 0; half < 2; half++) {
             msm8992_smem_store(base, c + 26 * 44 + half * 44 + 0, 2);
