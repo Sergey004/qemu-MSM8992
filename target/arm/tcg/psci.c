@@ -21,6 +21,7 @@
 #include "helper.h"
 #include "kvm-consts.h"
 #include "qemu/main-loop.h"
+#include "qemu/log.h"
 #include "system/runstate.h"
 #include "internals.h"
 #include "arm-powerctl.h"
@@ -99,6 +100,11 @@ void arm_handle_psci_call(ARMCPU *cpu)
     }
     trace_arm_psci_call(param[0], param[1], param[2], param[3],
                         arm_cpu_mp_affinity(cpu));
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "PSCI fid=0x%" PRIx64 " p1=0x%016" PRIx64 " p2=0x%016" PRIx64
+                  " p3=0x%016" PRIx64 "\n",
+                  param[0], param[1], param[2], param[3]);
 
     /* Non-PSCI SMC/HVC (e.g. Qualcomm SCM): hand to the board hook */
     if (arm_smc_vendor_handler && !arm_is_psci_fid(param[0])) {

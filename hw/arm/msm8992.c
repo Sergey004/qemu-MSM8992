@@ -136,10 +136,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MachineState, MSM8992_MACHINE)
  * the kernel sits in WFI forever right after its early boot.
  * (The GTDT also lists one platform timer: the QTIMER frame at
  * 0xF9020000 - modelled separately.) */
+/*
+ * ARM generic timer PPI routing.  The STOCK phone FFU ships a GTDT that
+ * declares (ACPI GTDT rev 2 field order: S-EL1, NS-EL1, Virtual, NS-EL2):
+ *
+ *     S-EL1  GSIV 0x12 (18) -> GIC PPI 2
+ *     NS-EL1 GSIV 0x13 (19) -> GIC PPI 3
+ *     Virt   GSIV 0x14 (20) -> GIC PPI 4
+ *     NS-EL2 GSIV 0x11 (17) -> GIC PPI 1
+ *
+ * The HAL's platform-provider path (GUID {0D4818E9-...} query) submits an
+ * async request and then polls provider+0x38 for 30 s (HAL rva 0x9708).
+ * That flag is set from the VIRTUAL timer (CNTV) interrupt, so the virtual
+ * timer must be wired to the GSIV the firmware/OS actually uses.  With the
+ * old mapping (Virt -> GSIV 17) the interrupt never arrived, the wait timed
+ * out and HalInitSystem bugchecked with 0x5C/0x110.
+ */
 #define MSM8992_PHYS_TIMER_PPI  3    /* NS-EL1 timer, GSIV 19 */
-#define MSM8992_VIRT_TIMER_PPI  1    /* virtual timer, GSIV 17 */
-#define MSM8992_HYP_TIMER_PPI   4    /* EL2 timer, GSIV 20 */
-#define MSM8992_SEC_TIMER_PPI   14   /* S-EL1: absent in GTDT, unused */
+#define MSM8992_VIRT_TIMER_PPI  4    /* virtual timer, GSIV 20 (stock GTDT) */
+#define MSM8992_HYP_TIMER_PPI   1    /* EL2 timer, GSIV 17 (stock GTDT) */
+#define MSM8992_SEC_TIMER_PPI   2    /* S-EL1, GSIV 18 (stock GTDT) */
 #define GIC_MAINTENANCE_PPI     9
 
 struct Msm8992MachineState {
