@@ -268,5 +268,14 @@ typedef int32_t (*ARMSmcVendorHandler)(ARMCPU *cpu, uint64_t func_id,
 
 void arm_register_smc_vendor_handler(ARMSmcVendorHandler handler);
 
+/*
+ * Board hook for PSCI CPU_ON: the board may start the secondary processor
+ * itself (the phone's TrustZone does; Windows then only passes the target
+ * id and expects the secure world to know the entry point).
+ */
+typedef int32_t (*ARMPsciCpuOnHandler)(uint64_t mpidr, uint64_t entry,
+                                       uint64_t context_id);
+void arm_register_psci_cpu_on_handler(ARMPsciCpuOnHandler handler);
+
 #endif /* HW_ARM_BOOT_H */
  /* HW_ARM_BOOT_H */

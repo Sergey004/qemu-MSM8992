@@ -39,6 +39,7 @@
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
 #include "hw/arm/boot.h"
+#include "target/arm/arm-powerctl.h"
 #include "hw/arm/bsa.h"
 #include "hw/intc/arm_gic_common.h"
 #include "hw/intc/arm_gic.h"
@@ -75,6 +76,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MachineState, MSM8992_MACHINE)
 #define MSM8992_DRAM_BASE   0x00000000ULL
 #define MSM8992_DRAM_SIZE   (3ULL * GiB)        /* 0x0 .. 0xBFFFFFFF */
 #define MSM8992_FB_BASE     0x00400000ULL       /* 1080x1920x32 window in DRAM */
+
+/*
+ * ACPI MADT "Parking Protocol Version 1" (the stock MADT of the phone's
+ * FFU): one parked address per processor --
+ *     cpu0 0x301000  cpu1 0x302000  ...  cpu5 0x306000
+ * The OS publishes the secondary's entry point in the 64-bit slot at the
+ * start of that page; the MPPark code running on the secondary picks it up.
+ * The pages are plain RAM (the OEM UEFI uses the same area for its own
+ * MpPark handshake), so the machine polls them instead of intercepting the
+ * accesses - intercepting them breaks the UEFI's SEC phase.
+ */
+#define MSM8992_PARK_BASE   0x00301000ULL
+#define MSM8992_PARK_SIZE   0x00006000ULL
+#define MSM8992_PARK_SLOT   8          /* bytes per parking slot */
+#define MSM8992_PARK_POLL_MS 10
 /* Boot stack for the AArch32 firmware entry (32-bit stock UEFI).  A real
  * bootloader hands the firmware a stack; the stock UEFI verifies its stack
  * canary in the first instructions and reports "Detected Stack Corruption"
@@ -167,6 +183,7 @@ struct Msm8992MachineState {
     DeviceState *gic;
     DeviceState *sdc1;
     DeviceState *sdc2;
+    QEMUTimer *park_timer;          /* ACPI MADT parking-protocol poll */
     struct arm_boot_info bootinfo;
 
     bool secure;                    /* provide EL3 (stock-TZ experiments) */
@@ -1893,6 +1910,79 @@ static int32_t msm8992_scm_call(ARMCPU *cpu, uint64_t id, uint64_t a1,
     return 0;
 }
 
+
+
+/* Release a secondary from its MADT parking slot once the OS publishes an
+ * entry point there (the MPPark code on the phone does that in the secure
+ * world; here the machine plays that role). */
+static bool msm8992_park_is_entry(uint64_t v)
+{
+    /* the firmware magics of the MpPark handshake are not entry points */
+    if (v == 0 || v == 0xffffffffULL || v == 0xfffffff1ULL ||
+        v == 0xfffffff3ULL) {
+        return false;
+    }
+    /* an AArch32 entry point in DRAM with the Thumb bit set */
+    return v < 0xC0000000ULL && (v & 1);
+}
+
+static void msm8992_park_poll(void *opaque)
+{
+    Msm8992MachineState *s = opaque;
+    uint8_t *ram = memory_region_get_ram_ptr(s->parent_obj.ram);
+    unsigned int cpu;
+
+    for (cpu = 1; cpu < MSM8992_NUM_CPUS; cpu++) {
+        uint64_t entry;
+        CPUState *cs;
+
+        memcpy(&entry, ram + MSM8992_PARK_BASE + (uint64_t)cpu * 0x1000, 8);
+        if (!msm8992_park_is_entry(entry)) {
+            continue;
+        }
+        cs = CPU(&s->cpu[cpu]);
+        if (ARM_CPU(cs)->power_state != PSCI_OFF) {
+            continue;                 /* already running */
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "parking: releasing cpu%u at 0x%" PRIx64 "\n", cpu, entry);
+        arm_set_cpu_on(arm_cpu_mp_affinity(ARM_CPU(cs)), entry, 0, 1, false);
+    }
+}
+
+/* --- secondary processor start ------------------------------------------
+ *
+ * Windows on ARM32 knows the real MSM8992 processor ids (they are built
+ * into the OS: 0x84000000/01/0b/0c/0f/10/11) and passes them to PSCI
+ * CPU_ON.  Our machine uses the community layout (0..3 for the little
+ * cluster, 0x100/0x101 for the big one) because the OEM firmware that
+ * runs in this setup expects exactly that.  Translate the ids here, and
+ * start the secondary in AArch32 at EL1 like the kernel itself.
+ */
+static int32_t msm8992_psci_cpu_on(uint64_t mpidr, uint64_t entry,
+                                   uint64_t context_id)
+{
+    static const struct {
+        uint64_t phone;
+        uint64_t ours;
+    } msm8992_cpu_id_map[] = {
+        { 0x84000001, 1 }, { 0x8400000b, 2 }, { 0x8400000c, 3 },
+        { 0x8400000f, 0x100 }, { 0x84000010, 0x101 },
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(msm8992_cpu_id_map); i++) {
+        if (msm8992_cpu_id_map[i].phone == mpidr) {
+            mpidr = msm8992_cpu_id_map[i].ours;
+            break;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "psci: cpu_on id=0x%" PRIx64 " entry=0x%" PRIx64 " -> 0x%"
+                  PRIx64 "\n", mpidr, entry, mpidr);
+    return arm_set_cpu_on(mpidr, entry, context_id, 1, false);
+}
+
 /* Park every non-primary CPU in the wfi stub at MSM8992_SMP_PARK. */
 static void msm8992_secondary_park(ARMCPU *cpu,
                                    const struct arm_boot_info *info)
@@ -1932,6 +2022,12 @@ static void msm8992_init(MachineState *machine)
 
     msm8992_create_cpus(s, machine);
     msm8992_create_gic(s, machine);
+
+    /* the machine plays the TrustZone role for the secondary processors */
+    arm_register_psci_cpu_on_handler(msm8992_psci_cpu_on);
+    s->park_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, msm8992_park_poll, s);
+    timer_mod(s->park_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              1000000ULL * MSM8992_PARK_POLL_MS);
 
     /* SPI lines pass 1:1 to the GIC's external inputs */
     gic_spi = g_new(qemu_irq, MSM8992_GIC_NUM_SPI);
