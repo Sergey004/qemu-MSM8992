@@ -103,8 +103,9 @@ void arm_handle_psci_call(ARMCPU *cpu)
 
     qemu_log_mask(LOG_GUEST_ERROR,
                   "PSCI fid=0x%" PRIx64 " p1=0x%016" PRIx64 " p2=0x%016" PRIx64
-                  " p3=0x%016" PRIx64 "\n",
-                  param[0], param[1], param[2], param[3]);
+                  " p3=0x%016" PRIx64 " pc=0x%08x\n",
+                  param[0], param[1], param[2], param[3],
+                  (uint32_t)env->regs[15]);
 
     /* Non-PSCI SMC/HVC (e.g. Qualcomm SCM): hand to the board hook */
     if (arm_smc_vendor_handler && !arm_is_psci_fid(param[0])) {
