@@ -1595,7 +1595,8 @@ static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
             timer_mod(cpu->gt_timer[timeridx], nexttick);
         }
         trace_arm_gt_recalc(timeridx, nexttick);
-    } else {
+    }
+ else {
         /* Timer disabled: ISTATUS and timer output always clear */
         gt->ctl &= ~4;
         timer_del(cpu->gt_timer[timeridx]);
@@ -10440,3 +10441,16 @@ ARMSecuritySpace arm_security_space_below_el3(CPUARMState *env)
     }
 }
 #endif /* !CONFIG_USER_ONLY */
+
+/* Public API: enable the EL1 physical timer (as the TrustZone would do
+ * before starting the OS).  The timer fires when the counter reaches
+ * cval; setting cval=0 makes it fire immediately (the counter is > 0). */
+void arm_gt_enable_phys_timer(ARMCPU *cpu);
+void arm_gt_enable_phys_timer(ARMCPU *cpu)
+{
+    CPUARMState *env = &cpu->env;
+
+    env->cp15.c14_timer[GTIMER_PHYS].cval = 0;
+    env->cp15.c14_timer[GTIMER_PHYS].ctl = 1;   /* ENABLE, IMASK=0 */
+    gt_recalc_timer(cpu, GTIMER_PHYS);
+}

@@ -285,5 +285,10 @@ void arm_register_psci_cpu_on_handler(ARMPsciCpuOnHandler handler);
 typedef void (*ARMPsciFirstCallHandler)(void);
 void arm_register_psci_first_call_handler(ARMPsciFirstCallHandler handler);
 
+/* Enable the EL1 physical timer (as the phone TZ does before booting
+ * the OS).  Sets CNTP_CTL=ENABLE and CNTP_CVAL=0 so the timer fires
+ * immediately, giving the kernel its first tick. */
+void arm_gt_enable_phys_timer(void *cpu);
+
 #endif /* HW_ARM_BOOT_H */
  /* HW_ARM_BOOT_H */

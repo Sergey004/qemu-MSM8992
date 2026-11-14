@@ -194,6 +194,7 @@ struct Msm8992MachineState {
     bool fadt_fixed;                 /* FADT ARM_BOOT_ARCH patched */
     bool mppark_fixed;               /* MpParkDxe compliance check cleared */
     bool madt_single;                /* MADT patched to single CPU */
+    bool barrier_patched;            /* kernel phase barrier bypassed */
     uint32_t cpu0_freq_khz;         /* rate of CPU core 0 (A53) */
     uint32_t ddr_freq_khz;          /* DRAM clock rate (LPDDR3-1866) */
 };
@@ -2017,6 +2018,96 @@ static void msm8992_park_poll(void *opaque)
     }
 
     /*
+     * Patch the kernel's phase barrier.  The barrier at nt+0x119fb0 is a
+     * conditional branch that only continues when a global counter (which
+     * is incremented by timer ticks or other subsystems) reaches the
+     * expected phase.  Since the kernel receives zero interrupts on our
+     * platform, the counter never advances and the kernel waits forever.
+     *
+     * Patch the conditional branch (beq) to unconditional (b) so the
+     * kernel proceeds past the barrier.
+     */
+    if (!s->barrier_patched) {
+        static const struct { uint64_t base, len; } kranges[] = {
+            { 0x00000000, 0x04000000 }, { 0x7e000000, 0x01000000 }
+        };
+        unsigned int kr;
+
+        for (kr = 0; kr < ARRAY_SIZE(kranges); kr++) {
+            size_t klimit = kranges[kr].base + kranges[kr].len;
+            size_t ki;
+
+            if (klimit > memory_region_size(s->parent_obj.ram)) {
+                klimit = memory_region_size(s->parent_obj.ram);
+            }
+            for (ki = kranges[kr].base; ki + 0x600000 < klimit; ki += 0x1000) {
+                uint8_t *kpe;
+                uint32_t koff;
+                uint16_t kmach, kmagic;
+                uint32_t kbarrier;
+                uint16_t khw;
+                uint8_t *kbr;
+
+                if (ram[ki] != 'M' || ram[ki + 1] != 'Z') {
+                    continue;
+                }
+                koff = *(uint32_t *)(ram + ki + 0x3c);
+                if (koff > 0x400 || ki + koff + 0x200 > klimit) {
+                    continue;
+                }
+                kpe = ram + ki + koff;
+                if (kpe[0] != 'P' || kpe[1] != 'E') {
+                    continue;
+                }
+                kmach = *(uint16_t *)(kpe + 4);
+                if (kmach != 0x01c4) {
+                    continue;
+                }
+                kmagic = *(uint16_t *)(kpe + 24);
+                if (kmagic != 0x10b) {
+                    continue;
+                }
+                /* check size: ntoskrnl is >4MB */
+                {
+                    uint16_t nsc = *(uint16_t *)(kpe + 6);
+                    uint32_t ksz = 0;
+                    unsigned int si;
+
+                    for (si = 0; si < nsc; si++) {
+                        uint32_t vsz = *(uint32_t *)(kpe + 40 + si * 40);
+                        uint32_t rva = *(uint32_t *)(kpe + 44 + si * 40);
+                        if (rva + vsz > ksz) ksz = rva + vsz;
+                    }
+                    if (ksz < 0x400000) {
+                        continue;
+                    }
+                    /* check debug directory has "ntkrnlmp" */
+                    if (memcmp(ram + ki + ksz - 0x1000, "ntkrnlmp", 8) != 0 &&
+                        memcmp(ram + ki + 0x1d8000, "ntkrnlmp", 8) != 0) {
+                        continue;
+                    }
+                }
+                kbarrier = ki + 0x119fb0;
+                kbr = ram + kbarrier;
+                khw = *(uint16_t *)kbr;
+                if ((khw & 0xF000) == 0xD000) {
+                    *kbr = ((khw >> 8) | 0xE0) & 0xFF;    /* cond -> AL */
+                    ram[kbarrier + 1] = (khw & 0xFF) | 0xE0 >> 8; /* hmm */
+                    /* simpler: write the full halfword */
+                    *(uint16_t *)kbr = (khw & 0x0FFF) | 0xE000;
+                    s->barrier_patched = true;
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "kernel: phase barrier patched at PA 0x%08x"
+                                  " (kernel base 0x%08x)\n",
+                                  (unsigned)kbarrier, (unsigned)ki);
+                }
+                break;
+            }
+            if (s->barrier_patched) break;
+        }
+    }
+
+    /*
      * Emulate the TrustZone's part of the MpPark hand-off.  When the OEM
      * UEFI decides the platform is not PSCI compliant it hands the parking
      * job to the secure world and then polls a per-CPU flag table
@@ -2504,6 +2595,47 @@ static void msm8992_tz_park_secondaries(void)
     if (!entry) {
         qemu_log_mask(LOG_GUEST_ERROR, "tz: kernel entry not found\n");
         return;
+    }
+
+    /*
+     * Pre-configure the GIC the way the phone's TrustZone does: the TZ
+     * enables the distributor and the CPU interface before the kernel
+     * boots, so the kernel never needs to write GICD_CTLR/GICC_CTLR
+     * itself.  Without this the ARM32 kernel receives zero interrupts.
+     */
+    {
+        uint32_t en = 1;      /* GICD_CTLR: enable group 0 */
+        uint32_t ctlr = 1;    /* GICC_CTLR: enable CPU interface */
+        uint32_t pmr = 0xFF;  /* GICC_PMR: all priorities */
+        uint32_t ise0 = 0xFFFFFFFF, ise1 = 0xFFFFFFFF;
+
+        address_space_write(&address_space_memory, 0xF9000000,
+                            MEMTXATTRS_UNSPECIFIED, &en, 4);
+        address_space_write(&address_space_memory, 0xF9002000,
+                            MEMTXATTRS_UNSPECIFIED, &ctlr, 4);
+        address_space_write(&address_space_memory, 0xF9002004,
+                            MEMTXATTRS_UNSPECIFIED, &pmr, 4);
+        /* enable all SPI interrupts (GICD_ISENABLER[0..1]) */
+        address_space_write(&address_space_memory, 0xF9000100,
+                            MEMTXATTRS_UNSPECIFIED, &ise0, 4);
+        address_space_write(&address_space_memory, 0xF9000104,
+                            MEMTXATTRS_UNSPECIFIED, &ise1, 4);
+        /* enable PPI for the physical timer (GICD_ISENABLER for INTID 19 =
+         * bit 3 in the PPI range 16-31, which is ISENABLER[0] bit 3) */
+        ise0 = (1U << 3) | (1U << 11);  /* PPI3 (phys timer) + PPI11 (virt) */
+        address_space_write(&address_space_memory, 0xF9000100,
+                            MEMTXATTRS_UNSPECIFIED, &ise0, 4);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tz: GIC pre-configured (CTLR=1 PMR=0xFF ISE=PPI+SPI)\n");
+    }
+
+    /* Enable the ARM generic timer for the boot CPU (the TZ does this on
+     * the phone).  Without this the kernel receives zero timer interrupts
+     * and its phase barrier never passes. */
+    {
+        ARMCPU *boot_cpu = ARM_CPU(CPU(&s->cpu[0]));
+        arm_gt_enable_phys_timer(boot_cpu);
+        qemu_log_mask(LOG_GUEST_ERROR, "tz: physical timer enabled\n");
     }
 
     /* Start every secondary CPU in AArch32 EL1 at the kernel entry (with
