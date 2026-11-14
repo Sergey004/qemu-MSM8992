@@ -60,6 +60,16 @@ static void arm_set_cpu_on_async_work(CPUState *target_cpu_state,
     /* We check if the started CPU is now at the correct level */
     assert(info->target_el == arm_current_el(&target_cpu->env));
 
+    if (!info->target_aa64 && target_cpu->env.aarch64) {
+        /*
+         * Enter AArch32 SVC at EL1: what the phone's TZ does when the
+         * 32-bit Windows kernel brings a secondary up through PSCI.
+         */
+        target_cpu->env.aarch64 = false;
+        target_cpu->env.uncached_cpsr = ARM_CPU_MODE_SVC | CPSR_I | CPSR_F
+                                        | CPSR_A;
+    }
+
     if (info->target_aa64) {
         target_cpu->env.xregs[0] = info->context_id;
     } else {
@@ -73,6 +83,12 @@ static void arm_set_cpu_on_async_work(CPUState *target_cpu_state,
 
     /* Start the new CPU at the requested address */
     cpu_set_pc(target_cpu_state, info->entry);
+    if (!info->target_aa64) {
+        /* PSCI AArch32 entry: bit0 of the entry point selects Thumb. */
+        target_cpu->env.thumb = info->entry & 1;
+        target_cpu->env.regs[15] = info->entry & ~1ULL;
+        arm_rebuild_hflags(&target_cpu->env);
+    }
 
     g_free(info);
 
@@ -140,14 +156,11 @@ int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
 
     if (!target_aa64 && arm_feature(&target_cpu->env, ARM_FEATURE_AARCH64)) {
         /*
-         * For now we don't support booting an AArch64 CPU in AArch32 mode
-         * TODO: We should add this support later
+         * The phone's TrustZone starts the AArch64-capable secondaries in
+         * AArch32 EL1 (the Windows kernel is 32-bit), so a CPU_ON that asks
+         * for AArch32 is normal here.  The mode switch happens in the async
+         * work below, after the reset.
          */
-        qemu_log_mask(LOG_UNIMP,
-                      "[ARM]%s: Starting AArch64 CPU %" PRId64
-                      " in AArch32 mode is not supported yet\n",
-                      __func__, cpuid);
-        return QEMU_ARM_POWERCTL_INVALID_PARAM;
     }
 
     /*

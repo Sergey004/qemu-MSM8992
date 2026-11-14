@@ -93,6 +93,14 @@ bool arm_is_psci_call(ARMCPU *cpu, int excp_type)
     return true;
 }
 
+/* Board hook: notified once, right after the guest's first PSCI call. */
+static ARMPsciFirstCallHandler arm_psci_first_call_handler;
+
+void arm_register_psci_first_call_handler(ARMPsciFirstCallHandler handler)
+{
+    arm_psci_first_call_handler = handler;
+}
+
 void arm_handle_psci_call(ARMCPU *cpu)
 {
     /*
@@ -108,7 +116,21 @@ void arm_handle_psci_call(ARMCPU *cpu)
     uint64_t context_id, mpidr;
     uint64_t entry;
     int32_t ret = 0;
+    static unsigned psci_calls_seen;
     int i;
+
+    /* The board may want to act when the OS starts talking PSCI (the
+     * phone's secure world parks the secondaries at that point). */
+    if (psci_calls_seen++ == 0 && arm_psci_first_call_handler) {
+        arm_psci_first_call_handler();
+    }
+
+    /* Debug aid: stop the VM right after the first PCSI call so a tracer
+     * can dump the caller's module while everything is still resident. */
+    if (psci_calls_seen == 1 && getenv("QEMU_PSCI_STOP")) {
+        qemu_log_mask(LOG_GUEST_ERROR, "PSCI-DEBUG-STOP\n");
+        qemu_system_debug_request();
+    }
 
     for (i = 0; i < 4; i++) {
         /*
@@ -127,6 +149,14 @@ void arm_handle_psci_call(ARMCPU *cpu)
                   param[0], param[1], param[2], param[3],
                   (uint32_t)env->regs[15], (uint32_t)env->regs[14],
                   (uint32_t)env->regs[13]);
+    /* unbuffered mirror: the -D log may lose its tail on kill -9 */
+    fprintf(stderr,
+            "PSCI fid=0x%llx p1=0x%llx p2=0x%llx p3=0x%llx "
+            "pc=0x%08x lr=0x%08x sp=0x%08x\n",
+            (unsigned long long)param[0], (unsigned long long)param[1],
+            (unsigned long long)param[2], (unsigned long long)param[3],
+            (uint32_t)env->regs[15], (uint32_t)env->regs[14],
+            (uint32_t)env->regs[13]);
 
     /* Non-PSCI SMC/HVC (e.g. Qualcomm SCM): hand to the board hook */
     if (arm_smc_vendor_handler && !arm_is_psci_fid(param[0])) {

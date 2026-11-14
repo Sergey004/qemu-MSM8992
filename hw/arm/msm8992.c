@@ -68,7 +68,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msm8992MachineState, MSM8992_MACHINE)
  * (MPIDR 0x100/0x101). MADT.asl (Lumia950XLPkg) lists the same MPIDRs.
  * Boot CPU is cpu0 = A53. */
 #define MSM8992_NUM_LITTLE  4
-#define MSM8992_NUM_BIG     2
+#define MSM8992_NUM_BIG     2      /* the Lumia 950 (MSM8992) has 6 cores */
 #define MSM8992_NUM_CPUS    (MSM8992_NUM_LITTLE + MSM8992_NUM_BIG)
 #define MSM8992_BOOT_CPU    0          /* cpu0 = first A53 */
 
@@ -189,6 +189,11 @@ struct Msm8992MachineState {
     bool secure;                    /* provide EL3 (stock-TZ experiments) */
     bool virt;                      /* provide EL2 */
     bool fullchain;                 /* PBL-stub->SBL1->TZ->UEFI chain mode */
+    bool ncpu_fixed;                /* AML NCPU corrected to match the MADT */
+    bool hal_cpu_on_opened;          /* HAL PSCI CPU_ON mechanism enabled */
+    bool fadt_fixed;                 /* FADT ARM_BOOT_ARCH patched */
+    bool mppark_fixed;               /* MpParkDxe compliance check cleared */
+    bool madt_single;                /* MADT patched to single CPU */
     uint32_t cpu0_freq_khz;         /* rate of CPU core 0 (A53) */
     uint32_t ddr_freq_khz;          /* DRAM clock rate (LPDDR3-1866) */
 };
@@ -1912,6 +1917,62 @@ static int32_t msm8992_scm_call(ARMCPU *cpu, uint64_t id, uint64_t a1,
 
 
 
+
+/* --- MPPark: what the phone's TrustZone does for the secondaries --------
+ *
+ * The OEM UEFI reserves PA 0x300000 (0x80000, "MPPark Code" in its memory
+ * map) and, when it is not "PSCI compliant", it would park the secondary
+ * processors there: a small AArch32 stub per processor polls the 64-bit
+ * slot at the MADT Parked Address (0x301000 + 0x1000 * uid) and branches
+ * to the entry point the OS publishes there.  On the phone the TrustZone
+ * performs that park; we have no TrustZone, so the machine does it.
+ *
+ * Stub (AArch32, thumb):
+ *     ldr  r0, [pc, #32]      ; &slot
+ *     ldr  r1, [r0]
+ *     cmp  r1, #0
+ *     beq  .-4
+ *     bx   r1                  ; -> the OS entry point
+ */
+static const uint8_t msm8992_mppark_stub[] = {
+    0x48, 0x08,             /* ldr  r0, [pc, #32]   */
+    0x68, 0x01,             /* ldr  r1, [r0]         */
+    0x29, 0x00,             /* cmp  r1, #0           */
+    0xd0, 0xfb,             /* beq  .-10             */
+    0x47, 0x08,             /* bx   r1               */
+};
+
+static void msm8992_mppark_setup(Msm8992MachineState *s)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(s->parent_obj.ram);
+    unsigned int cpu;
+
+    for (cpu = 1; cpu < MSM8992_NUM_CPUS; cpu++) {
+        /* the MADT Parked Address is the 64-bit slot the OS publishes the
+         * entry point into; the polling stub lives behind the slots so it
+         * does not overwrite them */
+        uint64_t slot = MSM8992_PARK_BASE + (uint64_t)cpu * 0x1000;
+        uint64_t stub = MSM8992_PARK_BASE + 0x6000 + (uint64_t)(cpu - 1) * 0x1000;
+        uint64_t entry;
+        CPUState *cs;
+
+        memcpy(ram + stub, msm8992_mppark_stub, sizeof(msm8992_mppark_stub));
+        /* the slot address literal sits 0x24 bytes into the stub */
+        entry = slot;
+        memcpy(ram + stub + 0x24, &entry, sizeof(entry));
+        memset(ram + slot, 0, 8);     /* no entry published yet */
+
+        cs = CPU(&s->cpu[cpu]);
+        if (ARM_CPU(cs)->power_state != PSCI_OFF) {
+            continue;
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mppark: parking cpu%u at 0x%" PRIx64 " (slot 0x%"
+                      PRIx64 ")\n", cpu, stub, slot);
+        arm_set_cpu_on(arm_cpu_mp_affinity(ARM_CPU(cs)), stub, 0, 1, false);
+    }
+}
+
 /* Release a secondary from its MADT parking slot once the OS publishes an
  * entry point there (the MPPark code on the phone does that in the secure
  * world; here the machine plays that role). */
@@ -1926,11 +1987,58 @@ static bool msm8992_park_is_entry(uint64_t v)
     return v < 0xC0000000ULL && (v & 1);
 }
 
+static void msm8992_fix_ncpu(Msm8992MachineState *s);
+static void msm8992_open_psci_cpu_on(Msm8992MachineState *s);
+static void msm8992_fix_fadt_arm_boot(Msm8992MachineState *s);
+static void msm8992_fix_mppark(Msm8992MachineState *s);
+static void msm8992_fix_madt_single_cpu(Msm8992MachineState *s);
+
 static void msm8992_park_poll(void *opaque)
 {
     Msm8992MachineState *s = opaque;
     uint8_t *ram = memory_region_get_ram_ptr(s->parent_obj.ram);
     unsigned int cpu;
+    static unsigned int tick_aml;
+
+    /* The FADT is published by the UEFI during DXE: clear the "PSCI
+     * compliant" bit before the OS parses the tables. */
+    if (!s->madt_single) {
+        msm8992_fix_madt_single_cpu(s);
+    }
+    /* The AML (NCPU) and the HAL image appear while the OS is loaded:
+     * correct the CPU count and open the PSCI CPU_ON mechanism. */
+    if ((++tick_aml % 25) == 0) {
+        if (!s->ncpu_fixed) {
+            msm8992_fix_ncpu(s);
+        }
+        if (!s->hal_cpu_on_opened) {
+            msm8992_open_psci_cpu_on(s);
+        }
+    }
+
+    /*
+     * Emulate the TrustZone's part of the MpPark hand-off.  When the OEM
+     * UEFI decides the platform is not PSCI compliant it hands the parking
+     * job to the secure world and then polls a per-CPU flag table
+     * (0x56430000, 64 bytes per CPU) until every CPU is parked.  We are
+     * that secure world: mark the CPUs parked when the UEFI is waiting.
+     */
+    {
+        CPUState *cs = CPU(&s->cpu[0]);
+        uint32_t pc = cs->cc->get_pc(cs);
+        static const uint32_t wait_lo = 0x10091760;
+        static const uint32_t wait_hi = 0x100917c0;
+
+        if (pc >= wait_lo && pc < wait_hi) {
+            unsigned int i;
+
+            for (i = 0; i < 8; i++) {
+                ram[0x56430000 + i * 0x40] = 1;
+            }
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "tz: UEFI MpPark flags set (pc 0x%08x)\n", pc);
+        }
+    }
 
     for (cpu = 1; cpu < MSM8992_NUM_CPUS; cpu++) {
         uint64_t entry;
@@ -1948,6 +2056,10 @@ static void msm8992_park_poll(void *opaque)
                       "parking: releasing cpu%u at 0x%" PRIx64 "\n", cpu, entry);
         arm_set_cpu_on(arm_cpu_mp_affinity(ARM_CPU(cs)), entry, 0, 1, false);
     }
+
+    /* keep polling */
+    timer_mod(s->park_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              1000000ULL * MSM8992_PARK_POLL_MS);
 }
 
 /* --- secondary processor start ------------------------------------------
@@ -1982,6 +2094,437 @@ static int32_t msm8992_psci_cpu_on(uint64_t mpidr, uint64_t entry,
                   PRIx64 "\n", mpidr, entry, mpidr);
     return arm_set_cpu_on(mpidr, entry, context_id, 1, false);
 }
+
+/*
+ * The phone's TrustZone parks the secondary CPUs: each one publishes
+ * 0xFFFFFFF1 into its MADT parking slot and waits there until the OS
+ * publishes the entry point into the same slot.  Windows ARM32 uses
+ * exactly that handshake (the MADT GICC "Parked Address" points at the
+ * slot); it never calls PSCI CPU_ON for them, because the FADT says the
+ * platform is PSCI compliant and the secure world owns the start.
+ *
+ * We have no TrustZone, so the machine plays that role: when the OS
+ * starts talking PSCI (its first PSCI call), we publish the parked
+ * signature into every MADT parking slot and start the secondary CPUs on
+ * a stub that waits for the signature and then jumps to the entry point
+ * the OS writes.
+ */
+#define MSM8992_PARK_SIGNATURE 0xFFFFFFF1ULL
+
+/* AArch32 (Thumb) stub: wait for the parked signature, then wait for the
+ * OS to replace it with the entry point and jump there.  The literal at
+ * offset 0x2c is the address of this CPU's parking slot. */
+/* AArch32 (Thumb) stub: wait until the HAL publishes the AP entry point
+ * into one of the fields of the per-CPU parking page and jump there.
+ * The literal at offset 0xe4 is the address of this CPU's page. */
+__attribute__((unused)) static const uint8_t msm8992_park_stub[] = {
+    0x39, 0x49, 0x0a, 0x68, 0x00, 0x2a, 0x0e, 0xd0, 0x4c, 0xf2, 0x00, 0x03,
+    0xc0, 0xf2, 0x00, 0x03, 0x9a, 0x42, 0x08, 0xd2, 0x4f, 0xf6, 0xff, 0x73,
+    0xc0, 0xf2, 0x00, 0x03, 0x02, 0xea, 0x03, 0x02, 0x00, 0x2a, 0x00, 0xd0,
+    0x10, 0x47, 0x0a, 0x6d, 0x00, 0x2a, 0x0e, 0xd0, 0x4c, 0xf2, 0x00, 0x03,
+    0xc0, 0xf2, 0x00, 0x03, 0x9a, 0x42, 0x08, 0xd2, 0x4f, 0xf6, 0xff, 0x73,
+    0xc0, 0xf2, 0x00, 0x03, 0x02, 0xea, 0x03, 0x02, 0x00, 0x2a, 0x00, 0xd0,
+    0x10, 0x47, 0xd1, 0xf8, 0x80, 0x20, 0x00, 0x2a, 0x0e, 0xd0, 0x4c, 0xf2,
+    0x00, 0x03, 0xc0, 0xf2, 0x00, 0x03, 0x9a, 0x42, 0x08, 0xd2, 0x4f, 0xf6,
+    0xff, 0x73, 0xc0, 0xf2, 0x00, 0x03, 0x02, 0xea, 0x03, 0x02, 0x00, 0x2a,
+    0x00, 0xd0, 0x10, 0x47, 0xd1, 0xf8, 0x90, 0x20, 0x00, 0x2a, 0x0e, 0xd0,
+    0x4c, 0xf2, 0x00, 0x03, 0xc0, 0xf2, 0x00, 0x03, 0x9a, 0x42, 0x08, 0xd2,
+    0x4f, 0xf6, 0xff, 0x73, 0xc0, 0xf2, 0x00, 0x03, 0x02, 0xea, 0x03, 0x02,
+    0x00, 0x2a, 0x00, 0xd0, 0x10, 0x47, 0xd1, 0xf8, 0xa8, 0x20, 0x00, 0x2a,
+    0x0e, 0xd0, 0x4c, 0xf2, 0x00, 0x03, 0xc0, 0xf2, 0x00, 0x03, 0x9a, 0x42,
+    0x08, 0xd2, 0x4f, 0xf6, 0xff, 0x73, 0xc0, 0xf2, 0x00, 0x03, 0x02, 0xea,
+    0x03, 0x02, 0x00, 0x2a, 0x00, 0xd0, 0x10, 0x47, 0xd1, 0xf8, 0xb0, 0x20,
+    0x00, 0x2a, 0x0e, 0xd0, 0x4c, 0xf2, 0x00, 0x03, 0xc0, 0xf2, 0x00, 0x03,
+    0x9a, 0x42, 0x08, 0xd2, 0x4f, 0xf6, 0xff, 0x73, 0xc0, 0xf2, 0x00, 0x03,
+    0x02, 0xea, 0x03, 0x02, 0x00, 0x2a, 0x00, 0xd0, 0x10, 0x47, 0x8e, 0xe7,
+    0x00, 0x10, 0x30, 0x00, 0xe4, 0x00, 0x00, 0x00,
+};
+
+static Msm8992MachineState *msm8992_machine;
+
+/*
+ * The OEM UEFI of this platform is an MSM8994 build: its uefiplat.cfg says
+ * NumCpus = 8, so the AML it publishes carries \_SB_.NCPU = "8" - while
+ * the MADT it builds describes the six cores the phone actually has.  The
+ * Windows HAL reads both (the CPUS method returns {NCPU, PSCI}) and the
+ * mismatch keeps it from starting any secondary CPU: the kernel then waits
+ * forever at a phase barrier.
+ *
+ * The AML object is a single byte, so the value can be corrected in place:
+ * "NCPU" = 8  ->  "NCPU" = 6, which matches the MADT.
+ */
+static const uint8_t msm8992_ncpu8_pattern[] = {
+    0x08, 'N', 'C', 'P', 'U', 0x0d, '8'
+};
+static const uint8_t msm8992_ncpu6_pattern[] = {
+    0x08, 'N', 'C', 'P', 'U', 0x0d, '6'
+};
+
+/*
+ * The HAL decides how each PSCI function may be reached.  Its table of
+ * "available mechanisms" starts out with only PSCI_VERSION (and one more)
+ * marked available: the PSCI_FEATURES probe fills the table in later, but
+ * the kernel starts the secondary CPUs BEFORE that probe runs, so on this
+ * platform CPU_ON is closed at the moment it matters and no secondary CPU
+ * is ever started.
+ *
+ * The phone gets this from the TrustZone, which implements PSCI CPU_ON.
+ * We are the TrustZone here, so open CPU_ON in the table as soon as the
+ * HAL image is in memory: the FID table at HAL+0x1594 identifies the
+ * image unambiguously, and the mechanism table lives at HAL+0x25574.
+ */
+static const uint8_t msm8992_psci_fid_table[] = {
+    0x00, 0x00, 0x00, 0x84, 0x03, 0x00, 0x00, 0x84, 0x01, 0x00, 0x00, 0x84,
+    0x02, 0x00, 0x00, 0x84, 0x0a, 0x00, 0x00, 0x84, 0x0b, 0x00, 0x00, 0x84,
+    0x0c, 0x00, 0x00, 0x84, 0x09, 0x00, 0x00, 0x84, 0x0f, 0x00, 0x00, 0x84,
+    0x10, 0x00, 0x00, 0x84, 0x11, 0x00, 0x00, 0x84,
+};
+
+#define MSM8992_HAL_FID_TABLE_RVA   0x1594
+#define MSM8992_HAL_MECH_TABLE_RVA  0x25574
+
+/*
+ * The FADT's ARM Boot Architecture Flags say "PSCI compliant" (bit 0) and
+ * "PSCI uses HVC" (bit 1) - 0x03.  That is what makes the OEM UEFI skip
+ * its MpPark hand-off ("PSCI_COMPLIANT - MpPark skipped"): it expects the
+ * secure world to park and start the secondary CPUs itself.
+ *
+ * We have no secure world: the OS then waits forever at its phase
+ * barrier for CPUs that nobody starts.  On a phone the TrustZone does the
+ * parking.  Clearing the "PSCI compliant" bit makes the UEFI build the
+ * MpPark structures and hand them over, and makes the OS use the ACPI
+ * parking protocol (it publishes the AP entry points in the MADT parking
+ * slots, which the parked CPUs pick up) - the same flow the phone uses
+ * when the platform does not implement PSCI CPU_ON.
+ */
+/*
+ * MpParkDxe caches the "PSCI compliant" answer and, when it is set, skips
+ * the MpPark hand-off to the secure world ("PSCI_COMPLIANT - MpPark
+ * skipped"), leaving the secondary CPUs to a secure world we do not run.
+ *
+ * We are that secure world.  Patch the driver in memory as soon as its
+ * image is in place: its "cached PSCI compliant" accessor is
+ *
+ *     MpParkDxe+0x2584: push {r3,r4,r5,lr}; ldr r0,[pc,#28]; ldr r0,[r0];
+ *                       str r0,[sp]; ldr r1,[pc,#24]; ldrb r1,[r1];
+ *                       and.w r4,r1,#1; ...; mov r0,r4; pop
+ *
+ * (the byte 1 mask is at RVA 0x2590).  Turning it into "return 0" makes
+ * every consumer take the MpPark hand-off path, which the phone would do
+ * whenever the secure world implements the parking protocol.
+ */
+static const uint8_t msm8992_mppark_needle[] =
+    "PSCI_COMPLIANT - MpPark skipped";
+#define MSM8992_MPPARK_STR_RVA   0x2a14
+#define MSM8992_MPPARK_AND_RVA   0x2590
+
+/*
+ * Zero the "Enabled" flag (bit 0) of every MADT GICC entry except the
+ * boot CPU's.  The kernel counts the enabled GICC entries to size its
+ * processor table; with only one enabled entry it boots as a
+ * single-processor system and does not wait at the phase barrier.
+ */
+static void msm8992_fix_madt_single_cpu(Msm8992MachineState *s)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(s->parent_obj.ram);
+    static const struct { uint64_t base, len; } ranges[] = {
+        { 0x00000000, 0x04000000 }, { 0x7e000000, 0x01000000 }
+    };
+    unsigned int r;
+
+    for (r = 0; r < ARRAY_SIZE(ranges); r++) {
+        size_t limit = ranges[r].base + ranges[r].len;
+        size_t i;
+
+        if (limit > memory_region_size(s->parent_obj.ram)) {
+            limit = memory_region_size(s->parent_obj.ram);
+        }
+        for (i = ranges[r].base; i + 0x300 < limit; i += 4) {
+            if (*(uint32_t *)(ram + i) != 0x43495041U) {   /* "APIC" */
+                continue;
+            }
+            uint32_t mlen = *(uint32_t *)(ram + i + 4);
+
+            if (mlen < 44 || mlen > 0x1000 || ram[i + 8] < 2) {
+                continue;
+            }
+            size_t off = i + 44;
+            unsigned int gicc = 0;
+
+            while (off + 2 <= i + mlen) {
+                uint8_t styp = ram[off];
+                uint8_t slen = ram[off + 1];
+
+                if (slen < 2 || off + slen > i + mlen) {
+                    break;
+                }
+                if (styp == 11 && slen >= 0x10) {
+                    uint32_t flags = *(uint32_t *)(ram + off + 12);
+
+                    if ((flags & 1) && gicc > 0) {
+                        *(uint32_t *)(ram + off + 12) = flags & ~1U;
+                        qemu_log_mask(LOG_GUEST_ERROR,
+                                      "acpi: MADT GICC[%u] disabled\n",
+                                      gicc);
+                        s->madt_single = true;
+                    }
+                    gicc++;
+                }
+                off += slen;
+            }
+            return;
+        }
+    }
+}
+
+__attribute__((unused)) static void msm8992_fix_mppark(Msm8992MachineState *s)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(s->parent_obj.ram);
+    size_t size = memory_region_size(s->parent_obj.ram);
+    static const struct { uint64_t base, len; } ranges[] = {
+        { 0x00000000, 0x04000000 }, { 0x7e000000, 0x01000000 }
+    };
+    unsigned int r;
+
+    for (r = 0; r < ARRAY_SIZE(ranges); r++) {
+        size_t limit = ranges[r].base + ranges[r].len;
+        size_t i;
+
+        if (limit > size) {
+            limit = size;
+        }
+        for (i = ranges[r].base; i + 0x40 < limit; i += 4) {
+            if (memcmp(ram + i, msm8992_mppark_needle,
+                       sizeof(msm8992_mppark_needle) - 1) != 0) {
+                continue;
+            }
+            uint64_t base = i - MSM8992_MPPARK_STR_RVA;
+            uint32_t movs = 0x2400, nop = 0xbf00;
+
+            if ((base & 0xfff) || ram[base] != 'M' || ram[base + 1] != 'Z') {
+                continue;
+            }
+            /* sanity: the accessor's and.w must be where we expect it */
+            if (*(uint32_t *)(ram + base + MSM8992_MPPARK_AND_RVA) !=
+                0x0104F001U) {
+                continue;
+            }
+            memcpy(ram + base + MSM8992_MPPARK_AND_RVA, &movs, 2);
+            memcpy(ram + base + MSM8992_MPPARK_AND_RVA + 2, &nop, 2);
+            s->mppark_fixed = true;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "hal: MpParkDxe compliance patched (base 0x%016"
+                          PRIx64 ")\n", (uint64_t)base);
+            return;
+        }
+    }
+}
+
+__attribute__((unused)) static void msm8992_fix_fadt_arm_boot(Msm8992MachineState *s)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(s->parent_obj.ram);
+    size_t size = memory_region_size(s->parent_obj.ram);
+    /* the UEFI publishes the ACPI tables either low or in its DXE pool */
+    static const struct { uint64_t base, len; } ranges[] = {
+        { 0x7e000000, 0x01000000 }
+    };
+    unsigned int r;
+
+    for (r = 0; r < ARRAY_SIZE(ranges); r++) {
+    size_t limit = ranges[r].base + ranges[r].len;
+    size_t i;
+
+    if (limit > size) {
+        limit = size;
+    }
+    for (i = ranges[r].base; i + 0x100 < limit; i += 4) {
+        if (*(uint32_t *)(ram + i) != 0x50434146U) {   /* "FACP" */
+            continue;
+        }
+        if (ram[i] == 'F' && ram[i + 1] == 'A' && ram[i + 2] == 'C' &&
+            ram[i + 3] == 'P') {
+            uint32_t len = *(uint32_t *)(ram + i + 4);
+            uint8_t *boot = ram + i + 0x74;
+
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "acpi: FACP seen at 0x%016" PRIx64
+                          " len=%u rev=%u boot=0x%02x\n",
+                          (uint64_t)i, len, ram[i + 8], *boot);
+
+            if (len != 244 || ram[i + 8] < 5) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "acpi: FADT candidate at 0x%016" PRIx64
+                              " len=%u rev=%u boot=0x%02x\n",
+                              (uint64_t)i, len, ram[i + 8], *boot);
+                continue;
+            }
+            if ((*boot & 1) && (*boot & 2)) {
+                *boot &= ~1;      /* keep the HVC conduit, drop "compliant" */
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "acpi: FADT at 0x%016" PRIx64
+                              ": ARM_BOOT_ARCH 0x%02x -> 0x%02x\n",
+                              (uint64_t)i, *boot, *boot);
+                s->fadt_fixed = true;
+            }
+        }
+    }
+    }
+}
+
+static void msm8992_open_psci_cpu_on(Msm8992MachineState *s)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(s->parent_obj.ram);
+    size_t size = memory_region_size(s->parent_obj.ram);
+    size_t i;
+    unsigned int fixed = 0;
+
+    size_t limit = 0x04000000;
+
+    if (limit > size) {
+        limit = size;
+    }
+    for (i = 0; i + sizeof(msm8992_psci_fid_table) <= limit; i += 4) {
+        if (*(uint32_t *)(ram + i) != 0x84000000U) {
+            continue;
+        }
+        if (memcmp(ram + i, msm8992_psci_fid_table,
+                   sizeof(msm8992_psci_fid_table)) == 0) {
+            uint64_t base = i - MSM8992_HAL_FID_TABLE_RVA;
+            uint32_t on = 2;
+
+            if (base + MSM8992_HAL_MECH_TABLE_RVA + 8 > size) {
+                continue;
+            }
+            /* the HAL image starts on a page boundary with an MZ header */
+            if ((base & 0xfff) || ram[base] != 'M' || ram[base + 1] != 'Z') {
+                continue;
+            }
+            /* mechanism[CPU_ON] = "available" */
+            memcpy(ram + base + MSM8992_HAL_MECH_TABLE_RVA + 4, &on,
+                   sizeof(on));
+            fixed++;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "hal: CPU_ON mechanism opened (HAL at 0x%016" PRIx64
+                          ")\n", (uint64_t)base);
+        }
+    }
+    if (fixed) {
+        s->hal_cpu_on_opened = true;
+    }
+}
+
+static void msm8992_fix_ncpu(Msm8992MachineState *s)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(s->parent_obj.ram);
+    size_t size = memory_region_size(s->parent_obj.ram);
+    size_t i;
+    unsigned int fixed = 0;
+
+    static const struct { uint64_t base, len; } ranges[] = {
+        { 0x00000000, 0x04000000 }, { 0x7e000000, 0x01000000 }
+    };
+    unsigned int r;
+
+    for (r = 0; r < ARRAY_SIZE(ranges); r++) {
+    size_t limit = ranges[r].base + ranges[r].len;
+
+    if (limit > size) {
+        limit = size;
+    }
+    for (i = ranges[r].base; i + sizeof(msm8992_ncpu8_pattern) <= limit;
+         i += 4) {
+        if (*(uint32_t *)(ram + i + 1) != 0x5550434eU) {   /* "NCPU" */
+            continue;
+        }
+        if (memcmp(ram + i, msm8992_ncpu8_pattern,
+                   sizeof(msm8992_ncpu8_pattern)) == 0) {
+            memcpy(ram + i, msm8992_ncpu6_pattern,
+                   sizeof(msm8992_ncpu6_pattern));
+            fixed++;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "acpi: NCPU 8 -> 6 at PA 0x%016" PRIx64 "\n",
+                          (uint64_t)i);
+        }
+    }
+    }
+    if (fixed) {
+        s->ncpu_fixed = true;
+    }
+}
+
+static void msm8992_tz_park_secondaries(void)
+{
+    Msm8992MachineState *s = msm8992_machine;
+    uint8_t *ram;
+    uint64_t entry = 0;
+    size_t i;
+    unsigned int cpu;
+
+    if (!s) {
+        return;
+    }
+    ram = memory_region_get_ram_ptr(s->parent_obj.ram);
+
+    /* Find the kernel entry point: scan the low 64 MB for the first PE32
+     * ARMNT image above 0x80000000.  On the phone the TZ does exactly this:
+     * it reads the OS image's entry point and starts the secondary CPUs
+     * there so they join KiSystemStartup and the SMP phase barrier. */
+    for (i = 0x00000000; i + 0x1000 < 0x04000000;
+         i += 0x1000) {
+        if (ram[i] != 'M' || ram[i + 1] != 'Z') {
+            continue;
+        }
+        uint32_t e_lfanew = *(uint32_t *)(ram + i + 0x3c);
+        uint8_t *pe;
+
+        if (e_lfanew > 0x400 || i + e_lfanew + 0x200 > 0x04000000) {
+            continue;
+        }
+        pe = ram + i + e_lfanew;
+        if (pe[0] != 'P' || pe[1] != 'E') {
+            continue;
+        }
+        uint16_t machine = *(uint16_t *)(pe + 4);
+        uint16_t magic = *(uint16_t *)(pe + 24);
+
+        if (machine != 0x01c4 || magic != 0x10b) {
+            continue;
+        }
+        uint32_t ep_rva = *(uint32_t *)(pe + 16 + 24);
+
+        if (ep_rva < 0x1000 || ep_rva > 0x600000) {
+            continue;
+        }
+        entry = i + ep_rva;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tz: kernel image at 0x%016llx, entry 0x%08llx\n",
+                      (unsigned long long)i, (unsigned long long)ep_rva);
+        break;
+    }
+    if (!entry) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tz: kernel entry not found\n");
+        return;
+    }
+
+    /* Start every secondary CPU in AArch32 EL1 at the kernel entry (with
+     * the Thumb bit set).  Each CPU identifies itself by its MPIDR inside
+     * KiSystemStartup. */
+    for (cpu = 1; cpu < MSM8992_NUM_CPUS; cpu++) {
+        uint64_t affinity = (cpu < MSM8992_NUM_LITTLE)
+                          ? cpu
+                          : ((1ULL << 8) | (cpu - MSM8992_NUM_LITTLE));
+        CPUState *cs = CPU(&s->cpu[cpu]);
+
+        if (ARM_CPU(cs)->power_state == PSCI_ON) {
+            continue;
+        }
+        arm_set_cpu_on(affinity, entry | 1, 0, 1, false);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tz: started cpu%u at kernel entry 0x%08llx\n",
+                      cpu, (unsigned long long)(entry | 1));
+    }
+}
+
 
 /* Park every non-primary CPU in the wfi stub at MSM8992_SMP_PARK. */
 static void msm8992_secondary_park(ARMCPU *cpu,
@@ -2025,6 +2568,19 @@ static void msm8992_init(MachineState *machine)
 
     /* the machine plays the TrustZone role for the secondary processors */
     arm_register_psci_cpu_on_handler(msm8992_psci_cpu_on);
+    msm8992_machine = s;
+    arm_register_psci_first_call_handler(msm8992_tz_park_secondaries);
+    /*
+     * Do NOT install the MpPark poll stubs by default: the secondaries
+     * have to stay parked in the wfi loop at MSM8992_SMP_PARK until the
+     * Windows kernel starts them with PSCI CPU_ON (the kernel's own entry
+     * point, AArch32 EL1).  Running a stub from the reserved "MPPark
+     * Code" area while the OEM UEFI is still in its SEC phase breaks the
+     * boot.  Set QEMU_MPPARK_STUBS=1 to try it anyway.
+     */
+    if (getenv("QEMU_MPPARK_STUBS")) {
+        msm8992_mppark_setup(s);
+    }
     s->park_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, msm8992_park_poll, s);
     timer_mod(s->park_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               1000000ULL * MSM8992_PARK_POLL_MS);

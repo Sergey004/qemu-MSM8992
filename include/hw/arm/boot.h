@@ -277,5 +277,13 @@ typedef int32_t (*ARMPsciCpuOnHandler)(uint64_t mpidr, uint64_t entry,
                                        uint64_t context_id);
 void arm_register_psci_cpu_on_handler(ARMPsciCpuOnHandler handler);
 
+/*
+ * Board hook for the first PSCI call of the guest.  The phone's secure
+ * world acts while the OS comes up (it parks the secondary CPUs), so the
+ * board may want to know when the OS started talking PSCI.
+ */
+typedef void (*ARMPsciFirstCallHandler)(void);
+void arm_register_psci_first_call_handler(ARMPsciFirstCallHandler handler);
+
 #endif /* HW_ARM_BOOT_H */
  /* HW_ARM_BOOT_H */
