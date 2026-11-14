@@ -1214,6 +1214,13 @@ static void gic_dist_writeb(void *opaque, hwaddr offset,
                     s->ctlr & GICD_CTLR_EN_GRP1 ? "En" : "Dis");
         } else if (offset < 4) {
             /* ignored.  */
+        } else if (offset >= 0x04 && offset < 0x80) {
+            /* Reserved in GICv2, but the Windows ARM32 kernel writes to
+             * these offsets during GIC init (probably GICv1 IGROUPR
+             * remnant or Qualcomm vendor extension).  Accept as RAZ/WI
+             * so the kernel continues its GIC init sequence instead of
+             * giving up after the first failed write. */
+            /* ignored */
         } else if (offset >= 0x80) {
             /* Interrupt Group Registers: RAZ/WI for NS access to secure
              * GIC, or for GICs without groups.
